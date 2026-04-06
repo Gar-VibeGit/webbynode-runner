@@ -1,32 +1,159 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ==========================================================================
+# Webbynode Benchmark Runner
+# Name: webbynode-bench
+# Version: v2.1-epoch-v2-hardened
+# ============================================================================
+
+SCRIPT_NAME="webbynode-bench"
+SCHEMA_VERSION="1.3"
+METHODOLOGY_VERSION="2.0"
+EPOCH="v2"
+
 BASE_DIR="/benchmarks"
-
-US_ENDPOINT_HOST="66.135.13.218"
-EU_ENDPOINT_HOST="46.225.222.50"
-
-US_TARGET_SLUG="us-east-iperf"
-EU_TARGET_SLUG="eu-west-iperf"
-
 IPERF_PORT="5201"
 IPERF_DURATION="${IPERF_DURATION:-15}"
 IPERF_PARALLEL="${IPERF_PARALLEL:-1}"
+IPERF_RETRIES_MAX="${IPERF_RETRIES_MAX:-3}"
+IPERF_RETRY_SLEEP="${IPERF_RETRY_SLEEP:-30}"
 
 FIO_RUNTIME="30"
+FIO_NUMJOBS="1"
+FIO_RW="randrw"
+FIO_RWMIXREAD="50"
+FIO_BS="4k"
+FIO_IODEPTH="64"
+FIO_FILENAME="fio.test"
+
+SYSBENCH_THREADS_OVERRIDE=""
+SYSBENCH_TIME="30"
+SYSBENCH_CPU_MAX_PRIME="20000"
+
+US_ENDPOINT="us-east.webbynode.com"
+EU_ENDPOINT="eu-west.webbynode.com"
+ASIA_ENDPOINT="asia.webbynode.com"
+
+RUNNER_ARGS=()
+PROVIDER=""
+REGION=""
+PLAN=""
+PRICE=""
+CURRENCY="USD"
+BILLING_PERIOD="monthly"
+
+PROVIDER_SLUG=""
+REGION_SLUG=""
+PLAN_SLUG=""
+RUN_DATE=""
+RUN_SEQ="001"
+RUN_ID=""
+RUN_DIR=""
+
+RUN_LOG=""
+RAW_SYSBENCH_LOG=""
+RAW_FIO_LOG=""
+RAW_IPERF_US_OUT_LOG=""
+RAW_IPERF_US_IN_LOG=""
+RAW_IPERF_EU_OUT_LOG=""
+RAW_IPERF_EU_IN_LOG=""
+RAW_IPERF_ASIA_OUT_LOG=""
+RAW_IPERF_ASIA_IN_LOG=""
+RUN_JSON=""
+RUN_MD=""
+
+STARTED_AT_UTC=""
+FINISHED_AT_UTC=""
+
+CPU_MODEL=""
+VCPU_COUNT=""
+RAM_GB=""
+OS_NAME=""
+KERNEL_VERSION=""
+HOSTNAME_FQDN=""
+ARCH=""
+VIRT_TYPE="unknown"
 FIO_SIZE="1G"
 
+GLOBAL_STATUS="ok"
+STATUS_NOTES=()
+
+CPU_STATUS="not_run"
+STORAGE_STATUS="not_run"
+
+NET_US_OUT_STATUS="not_run"
+NET_US_IN_STATUS="not_run"
+NET_EU_OUT_STATUS="not_run"
+NET_EU_IN_STATUS="not_run"
+NET_ASIA_OUT_STATUS="not_run"
+NET_ASIA_IN_STATUS="not_run"
+
+NET_US_OUT_RETRIES_USED="0"
+NET_US_IN_RETRIES_USED="0"
+NET_EU_OUT_RETRIES_USED="0"
+NET_EU_IN_RETRIES_USED="0"
+NET_ASIA_OUT_RETRIES_USED="0"
+NET_ASIA_IN_RETRIES_USED="0"
+
+CPU_EVENTS_PER_SECOND=""
+CPU_LAT_AVG=""
+CPU_LAT_P95=""
+CPU_LAT_P99=""
+
+FIO_READ_IOPS=""
+FIO_WRITE_IOPS=""
+FIO_VERSION=""
+FIO_READ_P95=""
+FIO_READ_P99=""
+FIO_WRITE_P95=""
+FIO_WRITE_P99=""
+FIO_PARSE_STATUS="not_run"
+
+US_OUT_REMOTE_HOST=""
+US_OUT_SENT_BPS=""
+US_OUT_RECEIVED_BPS=""
+US_IN_REMOTE_HOST=""
+US_IN_SENT_BPS=""
+US_IN_RECEIVED_BPS=""
+EU_OUT_REMOTE_HOST=""
+EU_OUT_SENT_BPS=""
+EU_OUT_RECEIVED_BPS=""
+EU_IN_REMOTE_HOST=""
+EU_IN_SENT_BPS=""
+EU_IN_RECEIVED_BPS=""
+ASIA_OUT_REMOTE_HOST=""
+ASIA_OUT_SENT_BPS=""
+ASIA_OUT_RECEIVED_BPS=""
+ASIA_IN_REMOTE_HOST=""
+ASIA_IN_SENT_BPS=""
+ASIA_IN_RECEIVED_BPS=""
+
 usage() {
-  cat <<EOF
+  cat <<EOF2
 Usage:
-  $0 --provider <provider> --region <region> --plan <plan> --price <price>
-EOF
-  exit 1
+  ${SCRIPT_NAME} --provider <provider> --region <region> --plan <plan> --price <price> [options]
+
+Required:
+  --provider         Provider display name
+  --region           Region display name
+  --plan             Plan display name
+  --price            Monthly price in USD
+
+Optional:
+  --iperf-parallel   iperf3 parallel streams (default: ${IPERF_PARALLEL})
+  --iperf-duration   iperf3 duration seconds (default: ${IPERF_DURATION})
+  -h, --help         Show help
+EOF2
 }
 
 die() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+log() {
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*"
 }
 
 slugify() {
@@ -35,8 +162,8 @@ slugify() {
   printf '%s' "$s"
 }
 
-log() {
-  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" | tee -a "$RUN_LOG"
+append_status_note() {
+  STATUS_NOTES+=("$1")
 }
 
 require_cmd() {
@@ -54,18 +181,163 @@ detect_os_name() {
 
 detect_virtualization() {
   if command -v systemd-detect-virt >/dev/null 2>&1; then
-    systemd-detect-virt 2>/dev/null || echo "unknown"
+    systemd-detect-virt 2>/dev/null || echo "none"
+    return 0
+  fi
+  if grep -qi hypervisor /proc/cpuinfo 2>/dev/null; then
+    echo "virtualized"
   else
     echo "unknown"
   fi
 }
 
-parse_args() {
-  PROVIDER=""
-  REGION=""
-  PLAN=""
-  PRICE=""
+to_float_gb() {
+  python3 - <<'PY' "$1"
+import sys
+kb = float(sys.argv[1])
+print(f"{kb / 1024 / 1024:.2f}")
+PY
+}
 
+compute_fio_size() {
+  python3 - <<'PY' "$1"
+import sys
+ram = float(sys.argv[1])
+if ram <= 8:
+    print("1G")
+elif ram <= 16:
+    print("2G")
+else:
+    print("4G")
+PY
+}
+
+ns_to_ms_expr() {
+  python3 - <<'PY' "$1"
+import sys
+v = sys.argv[1]
+if v in ("", "None", "null"):
+    print("null")
+else:
+    print(float(v) / 1_000_000)
+PY
+}
+
+bps_to_gbps_expr() {
+  python3 - <<'PY' "$1"
+import sys
+v = sys.argv[1]
+if v in ("", "None", "null"):
+    print("null")
+else:
+    print(float(v) / 1_000_000_000)
+PY
+}
+
+json_or_null() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf 'null'
+  else
+    printf '%s' "$v"
+  fi
+}
+
+ensure_dir() {
+  mkdir -p "$1"
+}
+
+ensure_base_dir_writable() {
+  ensure_dir "$BASE_DIR"
+  [[ -w "$BASE_DIR" ]] || die "BASE_DIR is not writable: $BASE_DIR"
+}
+
+validate_price() {
+  python3 - <<'PY' "$PRICE"
+import sys
+try:
+    value = float(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+if value < 0:
+    raise SystemExit(1)
+PY
+}
+
+timestamp_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+date_utc() {
+  date -u +"%Y-%m-%d"
+}
+
+build_run_id() {
+  printf '%s-%s-%s-%s-%s' "$PROVIDER_SLUG" "$REGION_SLUG" "$PLAN_SLUG" "$RUN_DATE" "$RUN_SEQ"
+}
+
+pick_next_sequence() {
+  local prefix="${PROVIDER_SLUG}-${REGION_SLUG}-${PLAN_SLUG}-${RUN_DATE}-"
+  local existing
+  existing="$(find "${BASE_DIR}/${PROVIDER_SLUG}" -maxdepth 1 -mindepth 1 -type d -name "${prefix}*" 2>/dev/null | sed -E "s|.*/${prefix}([0-9]+)$|\1|" | sort -n | tail -n 1 || true)"
+  if [[ -z "${existing:-}" ]]; then
+    echo "001"
+  else
+    printf '%03d' $((10#$existing + 1))
+  fi
+}
+
+update_global_status() {
+  local statuses=(
+    "$CPU_STATUS"
+    "$STORAGE_STATUS"
+    "$NET_US_OUT_STATUS"
+    "$NET_US_IN_STATUS"
+    "$NET_EU_OUT_STATUS"
+    "$NET_EU_IN_STATUS"
+    "$NET_ASIA_OUT_STATUS"
+    "$NET_ASIA_IN_STATUS"
+  )
+
+  GLOBAL_STATUS="ok"
+
+  for s in "${statuses[@]}"; do
+    case "$s" in
+      failed|failed_error|parse_error|missing)
+        GLOBAL_STATUS="error"
+        return 0
+        ;;
+      failed_busy)
+        if [[ "$GLOBAL_STATUS" != "error" ]]; then
+          GLOBAL_STATUS="partial"
+        fi
+        ;;
+      ok|not_run)
+        ;;
+      *)
+        GLOBAL_STATUS="error"
+        return 0
+        ;;
+    esac
+  done
+}
+
+cleanup_on_error() {
+  local exit_code=$?
+  FINISHED_AT_UTC="$(timestamp_utc)"
+  GLOBAL_STATUS="error"
+  append_status_note "runner_exit_code=${exit_code}"
+  log "Aborting with exit code ${exit_code}"
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    write_run_md || true
+    write_run_json || true
+  fi
+  exit "$exit_code"
+}
+trap cleanup_on_error ERR
+
+parse_args() {
+  RUNNER_ARGS=("$@")
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --provider)
@@ -84,8 +356,17 @@ parse_args() {
         PRICE="${2:-}"
         shift 2
         ;;
+      --iperf-parallel)
+        IPERF_PARALLEL="${2:-}"
+        shift 2
+        ;;
+      --iperf-duration)
+        IPERF_DURATION="${2:-}"
+        shift 2
+        ;;
       -h|--help)
         usage
+        exit 0
         ;;
       *)
         die "Unknown argument: $1"
@@ -93,24 +374,18 @@ parse_args() {
     esac
   done
 
-  [[ -n "$PROVIDER" ]] || usage
-  [[ -n "$REGION" ]] || usage
-  [[ -n "$PLAN" ]] || usage
-  [[ -n "$PRICE" ]] || usage
-}
+  [[ -n "$PROVIDER" ]] || die "--provider is required"
+  [[ -n "$REGION" ]] || die "--region is required"
+  [[ -n "$PLAN" ]] || die "--plan is required"
+  [[ -n "$PRICE" ]] || die "--price is required"
 
-validate_inputs() {
-  [[ "$IPERF_PARALLEL" =~ ^[0-9]+$ ]] || die "IPERF_PARALLEL must be an integer"
-  [[ "$IPERF_DURATION" =~ ^[0-9]+$ ]] || die "IPERF_DURATION must be an integer"
-
-  python3 - <<'PY' "$PRICE" || die "--price must be a non-negative number"
-import sys
-v = float(sys.argv[1])
-assert v >= 0
-PY
+  [[ "$IPERF_PARALLEL" =~ ^[0-9]+$ ]] || die "--iperf-parallel must be an integer"
+  [[ "$IPERF_DURATION" =~ ^[0-9]+$ ]] || die "--iperf-duration must be an integer"
+  validate_price || die "--price must be a non-negative number"
 }
 
 check_dependencies() {
+  require_cmd bash
   require_cmd python3
   require_cmd awk
   require_cmd sed
@@ -130,131 +405,163 @@ init_run() {
   PROVIDER_SLUG="$(slugify "$PROVIDER")"
   REGION_SLUG="$(slugify "$REGION")"
   PLAN_SLUG="$(slugify "$PLAN")"
-  RUN_DATE="$(date -u +"%Y-%m-%d")"
+  RUN_DATE="$(date_utc)"
 
-  mkdir -p "$BASE_DIR/$PROVIDER_SLUG"
+  ensure_dir "${BASE_DIR}/${PROVIDER_SLUG}"
+  RUN_SEQ="$(pick_next_sequence)"
+  RUN_ID="$(build_run_id)"
+  RUN_DIR="${BASE_DIR}/${PROVIDER_SLUG}/${RUN_ID}"
+  ensure_dir "$RUN_DIR"
 
-  local prefix="${PROVIDER_SLUG}-${REGION_SLUG}-${PLAN_SLUG}-${RUN_DATE}-"
-  local last_seq
-  last_seq="$(
-    find "$BASE_DIR/$PROVIDER_SLUG" -maxdepth 1 -mindepth 1 -type d -name "${prefix}[0-9][0-9][0-9]" 2>/dev/null \
-      | sed -nE "s|.*/${prefix}([0-9]{3})$|\1|p" \
-      | sort \
-      | tail -n 1
-  )"
+  RUN_LOG="${RUN_DIR}/run.log"
+  RAW_SYSBENCH_LOG="${RUN_DIR}/raw.sysbench.log"
+  RAW_FIO_LOG="${RUN_DIR}/raw.fio.log"
+  RAW_IPERF_US_OUT_LOG="${RUN_DIR}/raw.iperf-us-east-outbound.log"
+  RAW_IPERF_US_IN_LOG="${RUN_DIR}/raw.iperf-us-east-inbound.log"
+  RAW_IPERF_EU_OUT_LOG="${RUN_DIR}/raw.iperf-eu-west-outbound.log"
+  RAW_IPERF_EU_IN_LOG="${RUN_DIR}/raw.iperf-eu-west-inbound.log"
+  RAW_IPERF_ASIA_OUT_LOG="${RUN_DIR}/raw.iperf-asia-outbound.log"
+  RAW_IPERF_ASIA_IN_LOG="${RUN_DIR}/raw.iperf-asia-inbound.log"
+  RUN_JSON="${RUN_DIR}/run.json"
+  RUN_MD="${RUN_DIR}/run.md"
 
-  if [[ -z "${last_seq:-}" ]]; then
-    RUN_SEQ="001"
-  else
-    RUN_SEQ="$(printf '%03d' $((10#$last_seq + 1)))"
-  fi
+  STARTED_AT_UTC="$(timestamp_utc)"
+  exec > >(tee -a "$RUN_LOG") 2>&1
 
-  RUN_ID="${PROVIDER_SLUG}-${REGION_SLUG}-${PLAN_SLUG}-${RUN_DATE}-${RUN_SEQ}"
-  RUN_DIR="$BASE_DIR/$PROVIDER_SLUG/$RUN_ID"
-
-  mkdir -p "$RUN_DIR"
-
-  RUN_LOG="$RUN_DIR/run.log"
-  RAW_SYSBENCH_LOG="$RUN_DIR/raw.sysbench.log"
-  RAW_FIO_LOG="$RUN_DIR/raw.fio.log"
-  RAW_IPERF_US_OUT_LOG="$RUN_DIR/raw.iperf-us-east-outbound.log"
-  RAW_IPERF_US_IN_LOG="$RUN_DIR/raw.iperf-us-east-inbound.log"
-  RAW_IPERF_EU_OUT_LOG="$RUN_DIR/raw.iperf-eu-west-outbound.log"
-  RAW_IPERF_EU_IN_LOG="$RUN_DIR/raw.iperf-eu-west-inbound.log"
-  RUN_JSON="$RUN_DIR/run.json"
-  RUN_MD="$RUN_DIR/run.md"
-
-  TESTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  log "Starting benchmark $RUN_ID"
+  log "Starting benchmark ${RUN_ID}"
+  log "RUN_DIR=${RUN_DIR}"
 }
 
 detect_environment() {
   CPU_MODEL="$(lscpu | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+  [[ -n "$CPU_MODEL" ]] || CPU_MODEL="$(awk -F: '/model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
   [[ -n "$CPU_MODEL" ]] || CPU_MODEL="unknown"
 
-  VCPU_COUNT="$(nproc --all 2>/dev/null || echo 1)"
+  VCPU_COUNT="$(nproc --all 2>/dev/null || true)"
+  [[ -n "$VCPU_COUNT" ]] || VCPU_COUNT="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")"
 
-  RAM_GB="$(
-    python3 - <<'PY'
-import re
-mem_kb = 0
-with open('/proc/meminfo', 'r', encoding='utf-8') as f:
-    for line in f:
-        if line.startswith('MemTotal:'):
-            mem_kb = int(re.findall(r'\d+', line)[0])
-            break
-print(f"{mem_kb / 1024 / 1024:.2f}")
-PY
-  )"
+  local mem_kb
+  mem_kb="$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo)"
+  RAM_GB="$(to_float_gb "$mem_kb")"
 
   OS_NAME="$(detect_os_name)"
   KERNEL_VERSION="$(uname -r)"
   ARCH="$(uname -m)"
-  HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
+  HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")"
   VIRT_TYPE="$(detect_virtualization)"
+  FIO_SIZE="$(compute_fio_size "$RAM_GB")"
+
+  if [[ -z "$SYSBENCH_THREADS_OVERRIDE" ]]; then
+    SYSBENCH_THREADS_OVERRIDE="$VCPU_COUNT"
+  fi
 }
 
 run_cpu() {
   log "Running CPU benchmark"
+  local cmd=(
+    sysbench cpu
+    --threads="${SYSBENCH_THREADS_OVERRIDE}"
+    --time="${SYSBENCH_TIME}"
+    --cpu-max-prime="${SYSBENCH_CPU_MAX_PRIME}"
+    run
+  )
 
-  CPU_CMD="sysbench cpu --threads=${VCPU_COUNT} --time=30 --cpu-max-prime=20000 run"
-  echo "$CPU_CMD" > "$RUN_DIR/cmd.sysbench.txt"
-  eval "$CPU_CMD" > "$RAW_SYSBENCH_LOG" 2>&1
+  printf '%q ' "${cmd[@]}" | sed 's/ $/\n/' > "${RUN_DIR}/cmd.sysbench.txt"
+
+  set +e
+  "${cmd[@]}" | tee "$RAW_SYSBENCH_LOG"
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 && -s "$RAW_SYSBENCH_LOG" ]]; then
+    CPU_STATUS="ok"
+  else
+    CPU_STATUS="failed"
+    append_status_note "cpu=failed"
+    return 0
+  fi
 
   CPU_EVENTS_PER_SECOND="$(awk '/events per second:/ {print $4; exit}' "$RAW_SYSBENCH_LOG")"
   CPU_LAT_AVG="$(awk '/avg:/ {print $2; exit}' "$RAW_SYSBENCH_LOG")"
   CPU_LAT_P95="$(awk '/95th percentile:/ {print $3; exit}' "$RAW_SYSBENCH_LOG")"
-
-  [[ -n "${CPU_EVENTS_PER_SECOND:-}" ]] || die "Failed to parse CPU events_per_second"
-  [[ -n "${CPU_LAT_AVG:-}" ]] || CPU_LAT_AVG="null"
-  [[ -n "${CPU_LAT_P95:-}" ]] || CPU_LAT_P95="null"
+  CPU_LAT_P99=""
 }
 
 run_storage() {
   log "Running storage benchmark"
 
-  FIO_CMD="fio --name=webbynode-storage --filename=$RUN_DIR/fio.test --size=$FIO_SIZE --rw=randrw --rwmixread=50 --bs=4k --ioengine=libaio --direct=1 --iodepth=64 --numjobs=1 --time_based=1 --runtime=$FIO_RUNTIME --group_reporting=1 --output-format=json"
-  echo "$FIO_CMD" > "$RUN_DIR/cmd.fio.txt"
-  eval "$FIO_CMD" > "$RAW_FIO_LOG" 2>&1
+  local fio_target="${RUN_DIR}/${FIO_FILENAME}"
+  local cmd=(
+    fio
+    --name=webbynode-storage
+    --filename="${fio_target}"
+    --size="${FIO_SIZE}"
+    --rw="${FIO_RW}"
+    --rwmixread="${FIO_RWMIXREAD}"
+    --bs="${FIO_BS}"
+    --ioengine=libaio
+    --direct=1
+    --iodepth="${FIO_IODEPTH}"
+    --numjobs="${FIO_NUMJOBS}"
+    --time_based=1
+    --runtime="${FIO_RUNTIME}"
+    --group_reporting=1
+    --output-format=json
+  )
 
-  read -r FIO_READ_IOPS FIO_WRITE_IOPS FIO_VERSION FIO_READ_P95 FIO_READ_P99 FIO_WRITE_P95 FIO_WRITE_P99 <<EOF
-$(
-python3 - <<'PY' "$RAW_FIO_LOG"
-import json, sys
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    j = json.load(f)
-job = j["jobs"][0]
-fio_version = j.get("fio version", "")
-read_iops = job["read"]["iops"]
-write_iops = job["write"]["iops"]
-read_p95 = job["read"].get("clat_ns", {}).get("percentile", {}).get("95.000000")
-read_p99 = job["read"].get("clat_ns", {}).get("percentile", {}).get("99.000000")
-write_p95 = job["write"].get("clat_ns", {}).get("percentile", {}).get("95.000000")
-write_p99 = job["write"].get("clat_ns", {}).get("percentile", {}).get("99.000000")
-print(read_iops, write_iops, fio_version, read_p95, read_p99, write_p95, write_p99)
-PY
-)
-EOF
+  printf '%q ' "${cmd[@]}" | sed 's/ $/\n/' > "${RUN_DIR}/cmd.fio.txt"
 
-  rm -f "$RUN_DIR/fio.test" 2>/dev/null || true
-}
+  set +e
+  "${cmd[@]}" | tee "$RAW_FIO_LOG"
+  local rc=$?
+  set -e
 
-run_iperf_json() {
-  local host="$1"
-  local outfile="$2"
-  local reverse_flag="${3:-}"
+  rm -f "${fio_target}" 2>/dev/null || true
 
-  if [[ "$reverse_flag" == "reverse" ]]; then
-    iperf3 -c "$host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -J -R > "$outfile" 2>&1
-  else
-    iperf3 -c "$host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -J > "$outfile" 2>&1
+  if [[ $rc -ne 0 || ! -s "$RAW_FIO_LOG" ]]; then
+    STORAGE_STATUS="failed"
+    FIO_PARSE_STATUS="missing"
+    append_status_note "storage=failed"
+    return 0
   fi
+
+  local parsed
+  parsed="$(python3 - "$RAW_FIO_LOG" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        j = json.load(f)
+    job = j['jobs'][0]
+    fio_version = j.get('fio version', '')
+    read_iops = job['read'].get('iops')
+    write_iops = job['write'].get('iops')
+    rp95 = job['read'].get('clat_ns', {}).get('percentile', {}).get('95.000000')
+    rp99 = job['read'].get('clat_ns', {}).get('percentile', {}).get('99.000000')
+    wp95 = job['write'].get('clat_ns', {}).get('percentile', {}).get('95.000000')
+    wp99 = job['write'].get('clat_ns', {}).get('percentile', {}).get('99.000000')
+    vals = [read_iops, write_iops, fio_version, rp95, rp99, wp95, wp99]
+    print("\t".join("" if v is None else str(v) for v in vals))
+except Exception:
+    print("PARSE_ERROR")
+PY
+)"
+
+  if [[ "$parsed" == "PARSE_ERROR" || -z "$parsed" ]]; then
+    STORAGE_STATUS="parse_error"
+    FIO_PARSE_STATUS="parse_error"
+    append_status_note "storage=parse_error"
+    return 0
+  fi
+
+  IFS=$'\t' read -r FIO_READ_IOPS FIO_WRITE_IOPS FIO_VERSION FIO_READ_P95 FIO_READ_P99 FIO_WRITE_P95 FIO_WRITE_P99 <<< "$parsed"
+  STORAGE_STATUS="ok"
+  FIO_PARSE_STATUS="ok"
 }
 
 parse_iperf_json() {
-  local infile="$1"
-
-  python3 - <<'PY' "$infile"
+  local path="$1"
+  python3 - "$path" <<'PY'
 import json, sys
 path = sys.argv[1]
 try:
@@ -267,284 +574,542 @@ try:
     sum_received = end.get("sum_received", {})
     sent_bps = sum_sent.get("bits_per_second")
     recv_bps = sum_received.get("bits_per_second")
-    if sent_bps is None or recv_bps is None:
-        raise ValueError("missing throughput fields")
-    print(remote_host, sent_bps, recv_bps)
+    if "error" in j:
+        print("ERROR\t" + str(j.get("error", "")))
+    elif sent_bps is None or recv_bps is None:
+        print("PARSE_ERROR")
+    else:
+        print("OK\t{}\t{}\t{}".format(remote_host, sent_bps, recv_bps))
 except Exception:
     print("PARSE_ERROR")
 PY
 }
 
-run_network() {
-  log "Running US outbound network benchmark"
-  run_iperf_json "$US_ENDPOINT_HOST" "$RAW_IPERF_US_OUT_LOG"
+run_iperf_with_retry() {
+  local endpoint_host="$1"
+  local outfile="$2"
+  local reverse_flag="${3:-}"
+  local status_var="$4"
+  local retries_var="$5"
+  local label="$6"
+  local attempt=1
+  local rc=0
 
-  log "Running US inbound network benchmark"
-  run_iperf_json "$US_ENDPOINT_HOST" "$RAW_IPERF_US_IN_LOG" reverse
+  while (( attempt <= IPERF_RETRIES_MAX )); do
+    printf '%q ' iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" ${reverse_flag:+-R} -J | sed 's/ $/\n/' > "${outfile%.log}.cmd.txt"
 
-  log "Running EU outbound network benchmark"
-  run_iperf_json "$EU_ENDPOINT_HOST" "$RAW_IPERF_EU_OUT_LOG"
+    set +e
+    if [[ "$reverse_flag" == "reverse" ]]; then
+      iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -R -J > "$outfile" 2>&1
+    else
+      iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -J > "$outfile" 2>&1
+    fi
+    rc=$?
+    set -e
 
-  log "Running EU inbound network benchmark"
-  run_iperf_json "$EU_ENDPOINT_HOST" "$RAW_IPERF_EU_IN_LOG" reverse
+    printf -v "$retries_var" '%s' "$((attempt - 1))"
 
+    local parsed
+    parsed="$(parse_iperf_json "$outfile")"
+
+    if [[ "$parsed" == OK$'\t'* ]]; then
+      printf -v "$status_var" '%s' "ok"
+      return 0
+    fi
+
+    if grep -qi 'server is busy' "$outfile"; then
+      if (( attempt < IPERF_RETRIES_MAX )); then
+        append_status_note "${label}=busy_retry_${attempt}"
+        sleep "$IPERF_RETRY_SLEEP"
+        ((attempt++))
+        continue
+      else
+        printf -v "$status_var" '%s' "failed_busy"
+        append_status_note "${label}=failed_busy"
+        return 0
+      fi
+    fi
+
+    if (( attempt < IPERF_RETRIES_MAX )); then
+      append_status_note "${label}=retry_${attempt}_rc_${rc}"
+      sleep "$IPERF_RETRY_SLEEP"
+      ((attempt++))
+      continue
+    fi
+
+    printf -v "$status_var" '%s' "failed_error"
+    append_status_note "${label}=failed_error_rc_${rc}"
+    return 0
+  done
+}
+
+capture_iperf_metrics() {
+  local path="$1"
+  local remote_var="$2"
+  local sent_var="$3"
+  local recv_var="$4"
   local parsed
 
-  parsed="$(parse_iperf_json "$RAW_IPERF_US_OUT_LOG")"
-  [[ "$parsed" != "PARSE_ERROR" ]] || die "Failed to parse US outbound iperf JSON"
-  read -r US_OUT_REMOTE_HOST US_OUT_SENT_BPS US_OUT_RECEIVED_BPS <<< "$parsed"
-
-  parsed="$(parse_iperf_json "$RAW_IPERF_US_IN_LOG")"
-  [[ "$parsed" != "PARSE_ERROR" ]] || die "Failed to parse US inbound iperf JSON"
-  read -r US_IN_REMOTE_HOST US_IN_SENT_BPS US_IN_RECEIVED_BPS <<< "$parsed"
-
-  parsed="$(parse_iperf_json "$RAW_IPERF_EU_OUT_LOG")"
-  [[ "$parsed" != "PARSE_ERROR" ]] || die "Failed to parse EU outbound iperf JSON"
-  read -r EU_OUT_REMOTE_HOST EU_OUT_SENT_BPS EU_OUT_RECEIVED_BPS <<< "$parsed"
-
-  parsed="$(parse_iperf_json "$RAW_IPERF_EU_IN_LOG")"
-  [[ "$parsed" != "PARSE_ERROR" ]] || die "Failed to parse EU inbound iperf JSON"
-  read -r EU_IN_REMOTE_HOST EU_IN_SENT_BPS EU_IN_RECEIVED_BPS <<< "$parsed"
+  parsed="$(parse_iperf_json "$path")"
+  if [[ "$parsed" == OK$'\t'* ]]; then
+    local _tag remote sent recv
+    IFS=$'\t' read -r _tag remote sent recv <<< "$parsed"
+    printf -v "$remote_var" '%s' "$remote"
+    printf -v "$sent_var" '%s' "$sent"
+    printf -v "$recv_var" '%s' "$recv"
+  else
+    printf -v "$remote_var" '%s' ""
+    printf -v "$sent_var" '%s' ""
+    printf -v "$recv_var" '%s' ""
+  fi
 }
 
-ns_to_ms_expr() {
-  python3 - <<'PY' "$1"
-import sys
-v = sys.argv[1]
-if v in ("None", "", "null"):
-    print("null")
-else:
-    print(float(v) / 1_000_000)
-PY
-}
+run_network() {
+  log "Running US outbound network benchmark"
+  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_OUT_LOG" "" NET_US_OUT_STATUS NET_US_OUT_RETRIES_USED "us_outbound"
+  capture_iperf_metrics "$RAW_IPERF_US_OUT_LOG" US_OUT_REMOTE_HOST US_OUT_SENT_BPS US_OUT_RECEIVED_BPS
 
-bps_to_gbps_expr() {
-  python3 - <<'PY' "$1"
-import sys
-print(float(sys.argv[1]) / 1_000_000_000)
-PY
+  log "Running US inbound network benchmark"
+  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_IN_LOG" reverse NET_US_IN_STATUS NET_US_IN_RETRIES_USED "us_inbound"
+  capture_iperf_metrics "$RAW_IPERF_US_IN_LOG" US_IN_REMOTE_HOST US_IN_SENT_BPS US_IN_RECEIVED_BPS
+
+  log "Running EU outbound network benchmark"
+  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_OUT_LOG" "" NET_EU_OUT_STATUS NET_EU_OUT_RETRIES_USED "eu_outbound"
+  capture_iperf_metrics "$RAW_IPERF_EU_OUT_LOG" EU_OUT_REMOTE_HOST EU_OUT_SENT_BPS EU_OUT_RECEIVED_BPS
+
+  log "Running EU inbound network benchmark"
+  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_IN_LOG" reverse NET_EU_IN_STATUS NET_EU_IN_RETRIES_USED "eu_inbound"
+  capture_iperf_metrics "$RAW_IPERF_EU_IN_LOG" EU_IN_REMOTE_HOST EU_IN_SENT_BPS EU_IN_RECEIVED_BPS
+
+  log "Running Asia outbound network benchmark"
+  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_OUT_LOG" "" NET_ASIA_OUT_STATUS NET_ASIA_OUT_RETRIES_USED "asia_outbound"
+  capture_iperf_metrics "$RAW_IPERF_ASIA_OUT_LOG" ASIA_OUT_REMOTE_HOST ASIA_OUT_SENT_BPS ASIA_OUT_RECEIVED_BPS
+
+  log "Running Asia inbound network benchmark"
+  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_IN_LOG" reverse NET_ASIA_IN_STATUS NET_ASIA_IN_RETRIES_USED "asia_inbound"
+  capture_iperf_metrics "$RAW_IPERF_ASIA_IN_LOG" ASIA_IN_REMOTE_HOST ASIA_IN_SENT_BPS ASIA_IN_RECEIVED_BPS
 }
 
 write_run_md() {
-  cat > "$RUN_MD" <<EOF
-# $RUN_ID
+  cat > "$RUN_MD" <<EOF2
+# ${RUN_ID}
 
-- Provider: $PROVIDER
-- Region: $REGION
-- Plan: $PLAN
-- Price: $PRICE
-- Tested at: $TESTED_AT_UTC
+- Provider: ${PROVIDER}
+- Region: ${REGION}
+- Plan: ${PLAN}
+- Price: ${PRICE}
+- Started: ${STARTED_AT_UTC}
+- Finished: ${FINISHED_AT_UTC}
+- Epoch: ${EPOCH}
+- Methodology Version: ${METHODOLOGY_VERSION}
+- Status: ${GLOBAL_STATUS}
 
 ## Environment
-- CPU: $CPU_MODEL
-- vCPU: $VCPU_COUNT
-- RAM (GB): $RAM_GB
-- OS: $OS_NAME
-- Kernel: $KERNEL_VERSION
+- CPU: ${CPU_MODEL}
+- vCPU: ${VCPU_COUNT}
+- RAM (GB): ${RAM_GB}
+- OS: ${OS_NAME}
+- Kernel: ${KERNEL_VERSION}
+- Arch: ${ARCH}
+- Virtualization: ${VIRT_TYPE}
 
-## CPU
-- Events/s: $CPU_EVENTS_PER_SECOND
+## Test Status
+- CPU: ${CPU_STATUS}
+- Storage: ${STORAGE_STATUS}
+- US Outbound: ${NET_US_OUT_STATUS}
+- US Inbound: ${NET_US_IN_STATUS}
+- EU Outbound: ${NET_EU_OUT_STATUS}
+- EU Inbound: ${NET_EU_IN_STATUS}
+- Asia Outbound: ${NET_ASIA_OUT_STATUS}
+- Asia Inbound: ${NET_ASIA_IN_STATUS}
 
-## Storage
-- Read IOPS: $FIO_READ_IOPS
-- Write IOPS: $FIO_WRITE_IOPS
-
-## Network
-- US outbound Gbps: $(bps_to_gbps_expr "$US_OUT_RECEIVED_BPS")
-- US inbound Gbps: $(bps_to_gbps_expr "$US_IN_RECEIVED_BPS")
-- EU outbound Gbps: $(bps_to_gbps_expr "$EU_OUT_RECEIVED_BPS")
-- EU inbound Gbps: $(bps_to_gbps_expr "$EU_IN_RECEIVED_BPS")
-EOF
+## Artifacts
+- run.log
+- raw.sysbench.log
+- raw.fio.log
+- raw.iperf-us-east-outbound.log
+- raw.iperf-us-east-inbound.log
+- raw.iperf-eu-west-outbound.log
+- raw.iperf-eu-west-inbound.log
+- raw.iperf-asia-outbound.log
+- raw.iperf-asia-inbound.log
+- run.json
+EOF2
 }
 
 write_run_json() {
-  cat > "$RUN_JSON" <<EOF
-{
-  "version": "1.0",
-  "run_id": "$RUN_ID",
-  "metadata": {
-    "provider_slug": "$PROVIDER_SLUG",
-    "provider_name": "$PROVIDER",
-    "plan_slug": "$PLAN_SLUG",
-    "plan_name": "$PLAN",
-    "region_slug": "$REGION_SLUG",
-    "region_name": "$REGION",
-    "tested_at": "$TESTED_AT_UTC",
-    "cost": {
-      "amount": $PRICE,
-      "currency": "USD",
-      "interval": "monthly"
+  update_global_status
+  FINISHED_AT_UTC="${FINISHED_AT_UTC:-$(timestamp_utc)}"
+
+  python3 - "$RUN_JSON" \
+    "$SCHEMA_VERSION" \
+    "$EPOCH" \
+    "$METHODOLOGY_VERSION" \
+    "$RUN_ID" \
+    "$PROVIDER" \
+    "$PROVIDER_SLUG" \
+    "$REGION" \
+    "$REGION_SLUG" \
+    "$PLAN" \
+    "$PLAN_SLUG" \
+    "$PRICE" \
+    "$CPU_MODEL" \
+    "$VCPU_COUNT" \
+    "$RAM_GB" \
+    "$OS_NAME" \
+    "$KERNEL_VERSION" \
+    "$ARCH" \
+    "$VIRT_TYPE" \
+    "$HOSTNAME_FQDN" \
+    "$FIO_SIZE" \
+    "$GLOBAL_STATUS" \
+    "$STARTED_AT_UTC" \
+    "$FINISHED_AT_UTC" \
+    "$RUN_DIR" \
+    "$RUN_LOG" \
+    "$RAW_SYSBENCH_LOG" \
+    "$RAW_FIO_LOG" \
+    "$RAW_IPERF_US_OUT_LOG" \
+    "$RAW_IPERF_US_IN_LOG" \
+    "$RAW_IPERF_EU_OUT_LOG" \
+    "$RAW_IPERF_EU_IN_LOG" \
+    "$RAW_IPERF_ASIA_OUT_LOG" \
+    "$RAW_IPERF_ASIA_IN_LOG" \
+    "$RUN_MD" \
+    "$CPU_STATUS" \
+    "$STORAGE_STATUS" \
+    "$NET_US_OUT_STATUS" \
+    "$NET_US_IN_STATUS" \
+    "$NET_EU_OUT_STATUS" \
+    "$NET_EU_IN_STATUS" \
+    "$NET_ASIA_OUT_STATUS" \
+    "$NET_ASIA_IN_STATUS" \
+    "$NET_US_OUT_RETRIES_USED" \
+    "$NET_US_IN_RETRIES_USED" \
+    "$NET_EU_OUT_RETRIES_USED" \
+    "$NET_EU_IN_RETRIES_USED" \
+    "$NET_ASIA_OUT_RETRIES_USED" \
+    "$NET_ASIA_IN_RETRIES_USED" \
+    "$(printf '%s\n' "${STATUS_NOTES[@]:-}")" \
+    "$IPERF_PARALLEL" \
+    "$IPERF_DURATION" \
+    "$CPU_EVENTS_PER_SECOND" \
+    "$CPU_LAT_AVG" \
+    "$CPU_LAT_P95" \
+    "$FIO_PARSE_STATUS" \
+    "$FIO_VERSION" \
+    "$FIO_READ_IOPS" \
+    "$FIO_WRITE_IOPS" \
+    "$FIO_READ_P95" \
+    "$FIO_READ_P99" \
+    "$FIO_WRITE_P95" \
+    "$FIO_WRITE_P99" \
+    "$US_OUT_REMOTE_HOST" \
+    "$US_OUT_SENT_BPS" \
+    "$US_OUT_RECEIVED_BPS" \
+    "$US_IN_REMOTE_HOST" \
+    "$US_IN_SENT_BPS" \
+    "$US_IN_RECEIVED_BPS" \
+    "$EU_OUT_REMOTE_HOST" \
+    "$EU_OUT_SENT_BPS" \
+    "$EU_OUT_RECEIVED_BPS" \
+    "$EU_IN_REMOTE_HOST" \
+    "$EU_IN_SENT_BPS" \
+    "$EU_IN_RECEIVED_BPS" \
+    "$ASIA_OUT_REMOTE_HOST" \
+    "$ASIA_OUT_SENT_BPS" \
+    "$ASIA_OUT_RECEIVED_BPS" \
+    "$ASIA_IN_REMOTE_HOST" \
+    "$ASIA_IN_SENT_BPS" \
+    "$ASIA_IN_RECEIVED_BPS" <<'PY'
+import json, os, sys
+(
+  out_path,
+  schema_version,
+  epoch,
+  methodology_version,
+  run_id,
+  provider_name,
+  provider_slug,
+  region_name,
+  region_slug,
+  plan_name,
+  plan_slug,
+  price,
+  cpu_model,
+  vcpu_count,
+  ram_gb,
+  os_name,
+  kernel_version,
+  arch,
+  virt_type,
+  hostname_fqdn,
+  fio_size,
+  global_status,
+  started_at,
+  finished_at,
+  run_dir,
+  run_log,
+  raw_sysbench_log,
+  raw_fio_log,
+  raw_iperf_us_out_log,
+  raw_iperf_us_in_log,
+  raw_iperf_eu_out_log,
+  raw_iperf_eu_in_log,
+  raw_iperf_asia_out_log,
+  raw_iperf_asia_in_log,
+  run_md,
+  cpu_status,
+  storage_status,
+  net_us_out_status,
+  net_us_in_status,
+  net_eu_out_status,
+  net_eu_in_status,
+  net_asia_out_status,
+  net_asia_in_status,
+  net_us_out_retries_used,
+  net_us_in_retries_used,
+  net_eu_out_retries_used,
+  net_eu_in_retries_used,
+  net_asia_out_retries_used,
+  net_asia_in_retries_used,
+  status_notes_blob,
+  iperf_parallel,
+  iperf_duration,
+  cpu_events_per_second,
+  cpu_lat_avg,
+  cpu_lat_p95,
+  fio_parse_status,
+  fio_version,
+  fio_read_iops,
+  fio_write_iops,
+  fio_read_p95,
+  fio_read_p99,
+  fio_write_p95,
+  fio_write_p99,
+  us_out_remote_host,
+  us_out_sent_bps,
+  us_out_received_bps,
+  us_in_remote_host,
+  us_in_sent_bps,
+  us_in_received_bps,
+  eu_out_remote_host,
+  eu_out_sent_bps,
+  eu_out_received_bps,
+  eu_in_remote_host,
+  eu_in_sent_bps,
+  eu_in_received_bps,
+  asia_out_remote_host,
+  asia_out_sent_bps,
+  asia_out_received_bps,
+  asia_in_remote_host,
+  asia_in_sent_bps,
+  asia_in_received_bps,
+) = sys.argv[1:]
+
+def num(v):
+    if v in ("", "None", "null"):
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def integer(v):
+    n = num(v)
+    return int(n) if n is not None else None
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps):
+    result = {
+        "status": status if status else "missing",
+        "remote_host": host or None,
+        "sent_bps": num(sent_bps),
+        "received_bps": num(recv_bps),
     }
-  },
-  "environment": {
-    "os": "$OS_NAME",
-    "kernel": "$KERNEL_VERSION",
-    "architecture": "$ARCH",
-    "cpu_model": "$CPU_MODEL",
-    "vcpu_count": $VCPU_COUNT,
-    "ram_gb": $RAM_GB,
-    "virtualization_type": "$VIRT_TYPE"
-  },
-  "commands": {
-    "runner": "./webbynode-bench --provider \"$PROVIDER\" --region \"$REGION\" --plan \"$PLAN\" --price \"$PRICE\"",
-    "cpu": "$(sed 's/"/\\"/g' "$RUN_DIR/cmd.sysbench.txt")",
-    "storage": "$(sed 's/"/\\"/g' "$RUN_DIR/cmd.fio.txt")",
-    "network": [
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "command": "iperf3 -c $US_ENDPOINT_HOST -p $IPERF_PORT -P $IPERF_PARALLEL -t $IPERF_DURATION -J"
-      },
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "command": "iperf3 -c $US_ENDPOINT_HOST -p $IPERF_PORT -P $IPERF_PARALLEL -t $IPERF_DURATION -J -R"
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "command": "iperf3 -c $EU_ENDPOINT_HOST -p $IPERF_PORT -P $IPERF_PARALLEL -t $IPERF_DURATION -J"
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "command": "iperf3 -c $EU_ENDPOINT_HOST -p $IPERF_PORT -P $IPERF_PARALLEL -t $IPERF_DURATION -J -R"
-      }
-    ]
-  },
-  "benchmarks": {
-    "cpu": {
-      "tool": "sysbench",
-      "tool_version": "1.0.20",
-      "events_per_second": $CPU_EVENTS_PER_SECOND,
-      "latency_ms": {
-        "avg": $CPU_LAT_AVG,
-        "p95": $CPU_LAT_P95,
-        "p99": null
-      }
+    return {
+        "direction": direction,
+        "parallel_streams": integer(iperf_parallel),
+        "duration_seconds": integer(iperf_duration),
+        "retries_used": integer(retries),
+        "final_outcome": status,
+        "result": result,
+    }
+
+obj = {
+    "schema_version": schema_version,
+    "epoch": epoch,
+    "methodology_version": methodology_version,
+    "run_id": run_id,
+    "status": global_status,
+    "provider": {"name": provider_name, "slug": provider_slug},
+    "region": {"name": region_name, "slug": region_slug},
+    "plan": {"name": plan_name, "slug": plan_slug},
+    "pricing": {
+        "monthly_usd": num(price),
+        "currency": "USD",
+        "billing_period": "monthly",
     },
-    "storage": {
-      "tool": "fio",
-      "tool_version": "$FIO_VERSION",
-      "test_mode": "randrw",
-      "block_size": "4k",
-      "io_depth": 64,
-      "num_jobs": 1,
-      "runtime_seconds": $FIO_RUNTIME,
-      "read_iops": $FIO_READ_IOPS,
-      "write_iops": $FIO_WRITE_IOPS,
-      "latency_ms": {
-        "read_p95": $(ns_to_ms_expr "$FIO_READ_P95"),
-        "read_p99": $(ns_to_ms_expr "$FIO_READ_P99"),
-        "write_p95": $(ns_to_ms_expr "$FIO_WRITE_P95"),
-        "write_p99": $(ns_to_ms_expr "$FIO_WRITE_P99")
-      }
+    "environment": {
+        "cpu_model": cpu_model,
+        "vcpu_count": integer(vcpu_count),
+        "ram_gb": num(ram_gb),
+        "os": os_name,
+        "kernel": kernel_version,
+        "arch": arch,
+        "virtualization": virt_type,
+        "hostname": hostname_fqdn,
     },
-    "network": [
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "target_name": "US East iPerf Endpoint",
-        "direction": "outbound",
-        "throughput_gbps": $(bps_to_gbps_expr "$US_OUT_RECEIVED_BPS")
-      },
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "target_name": "US East iPerf Endpoint",
-        "direction": "inbound",
-        "throughput_gbps": $(bps_to_gbps_expr "$US_IN_RECEIVED_BPS")
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "target_name": "EU West iPerf Endpoint",
-        "direction": "outbound",
-        "throughput_gbps": $(bps_to_gbps_expr "$EU_OUT_RECEIVED_BPS")
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "target_name": "EU West iPerf Endpoint",
-        "direction": "inbound",
-        "throughput_gbps": $(bps_to_gbps_expr "$EU_IN_RECEIVED_BPS")
-      }
-    ]
-  },
-  "artifacts": {
-    "run_log": "run.log",
-    "raw_cpu_log": "raw.sysbench.log",
-    "raw_storage_log": "raw.fio.log",
-    "raw_network_logs": [
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "file": "raw.iperf-us-east-outbound.log"
-      },
-      {
-        "target_slug": "$US_TARGET_SLUG",
-        "file": "raw.iperf-us-east-inbound.log"
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "file": "raw.iperf-eu-west-outbound.log"
-      },
-      {
-        "target_slug": "$EU_TARGET_SLUG",
-        "file": "raw.iperf-eu-west-inbound.log"
-      }
-    ],
-    "draft_report_markdown": "run.md"
-  }
+    "commands": {
+        "runner": " ".join(["./webbynode-bench"] + []),
+        "cpu": read_text(os.path.join(run_dir, "cmd.sysbench.txt")),
+        "storage": read_text(os.path.join(run_dir, "cmd.fio.txt")),
+        "network": {
+            "us_east_outbound": read_text(raw_iperf_us_out_log.replace('.log', '.cmd.txt')),
+            "us_east_inbound": read_text(raw_iperf_us_in_log.replace('.log', '.cmd.txt')),
+            "eu_west_outbound": read_text(raw_iperf_eu_out_log.replace('.log', '.cmd.txt')),
+            "eu_west_inbound": read_text(raw_iperf_eu_in_log.replace('.log', '.cmd.txt')),
+            "asia_outbound": read_text(raw_iperf_asia_out_log.replace('.log', '.cmd.txt')),
+            "asia_inbound": read_text(raw_iperf_asia_in_log.replace('.log', '.cmd.txt')),
+        },
+    },
+    "results": {
+        "cpu": {
+            "status": cpu_status,
+            "events_per_second": num(cpu_events_per_second),
+            "latency_ms": {
+                "avg": num(cpu_lat_avg),
+                "p95": num(cpu_lat_p95),
+                "p99": None,
+            },
+        },
+        "storage": {
+            "status": storage_status,
+            "profile": {
+                "rw": "randrw",
+                "rwmixread": 50,
+                "ioengine": "libaio",
+                "direct": 1,
+                "size": fio_size,
+                "block_size": "4k",
+                "io_depth": 64,
+                "num_jobs": 1,
+                "runtime_seconds": 30,
+            },
+            "fio": {
+                "status": fio_parse_status,
+                "fio_version": fio_version or None,
+                "read_iops": num(fio_read_iops),
+                "write_iops": num(fio_write_iops),
+                "latency_ms": {
+                    "read_p95": (num(fio_read_p95) / 1_000_000) if num(fio_read_p95) is not None else None,
+                    "read_p99": (num(fio_read_p99) / 1_000_000) if num(fio_read_p99) is not None else None,
+                    "write_p95": (num(fio_write_p95) / 1_000_000) if num(fio_write_p95) is not None else None,
+                    "write_p99": (num(fio_write_p99) / 1_000_000) if num(fio_write_p99) is not None else None,
+                },
+            },
+        },
+        "network": {
+            "us_east": {
+                "endpoint": {"slug": "us-east", "host": "us-east.webbynode.com"},
+                "outbound": network_entry("us-east", us_out_remote_host, "outbound", net_us_out_status, net_us_out_retries_used, us_out_sent_bps, us_out_received_bps),
+                "inbound": network_entry("us-east", us_in_remote_host, "inbound", net_us_in_status, net_us_in_retries_used, us_in_sent_bps, us_in_received_bps),
+            },
+            "eu_west": {
+                "endpoint": {"slug": "eu-west", "host": "eu-west.webbynode.com"},
+                "outbound": network_entry("eu-west", eu_out_remote_host, "outbound", net_eu_out_status, net_eu_out_retries_used, eu_out_sent_bps, eu_out_received_bps),
+                "inbound": network_entry("eu-west", eu_in_remote_host, "inbound", net_eu_in_status, net_eu_in_retries_used, eu_in_sent_bps, eu_in_received_bps),
+            },
+            "asia": {
+                "endpoint": {"slug": "asia", "host": "asia.webbynode.com"},
+                "outbound": network_entry("asia", asia_out_remote_host, "outbound", net_asia_out_status, net_asia_out_retries_used, asia_out_sent_bps, asia_out_received_bps),
+                "inbound": network_entry("asia", asia_in_remote_host, "inbound", net_asia_in_status, net_asia_in_retries_used, asia_in_sent_bps, asia_in_received_bps),
+            },
+        },
+    },
+    "artifacts": {
+        "run_log": os.path.basename(run_log),
+        "run_md": os.path.basename(run_md),
+        "raw_sysbench_log": os.path.basename(raw_sysbench_log),
+        "raw_fio_log": os.path.basename(raw_fio_log),
+        "raw_iperf_us_out_log": os.path.basename(raw_iperf_us_out_log),
+        "raw_iperf_us_in_log": os.path.basename(raw_iperf_us_in_log),
+        "raw_iperf_eu_out_log": os.path.basename(raw_iperf_eu_out_log),
+        "raw_iperf_eu_in_log": os.path.basename(raw_iperf_eu_in_log),
+        "raw_iperf_asia_out_log": os.path.basename(raw_iperf_asia_out_log),
+        "raw_iperf_asia_in_log": os.path.basename(raw_iperf_asia_in_log),
+    },
+    "status_notes": [line for line in status_notes_blob.splitlines() if line.strip()],
+    "timestamps": {
+        "started_at_utc": started_at,
+        "finished_at_utc": finished_at,
+    },
 }
-EOF
+
+tmp_path = out_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(obj, f, indent=2, sort_keys=False)
+    f.write("\n")
+os.replace(tmp_path, out_path)
+PY
 }
 
 validate_run_json() {
-  python3 - <<'PY' "$RUN_JSON" "$RUN_DIR" "$RUN_ID"
+  log "Validating run.json"
+  python3 - "$RUN_JSON" "$RUN_DIR" "$RUN_ID" <<'PY'
 import json, os, re, sys
-
-run_json_path, run_dir, expected_run_id = sys.argv[1:]
-
-with open(run_json_path, "r", encoding="utf-8") as f:
+run_json, run_dir, expected_run_id = sys.argv[1:]
+with open(run_json, 'r', encoding='utf-8') as f:
     data = json.load(f)
-
-required = ["version", "run_id", "metadata", "environment", "commands", "benchmarks", "artifacts"]
-missing = [k for k in required if k not in data]
+required_top = [
+    'schema_version', 'epoch', 'methodology_version', 'run_id', 'status',
+    'provider', 'region', 'plan', 'pricing', 'environment', 'commands', 'results', 'artifacts', 'timestamps'
+]
+missing = [k for k in required_top if k not in data]
 if missing:
-    raise SystemExit(f"Missing keys: {missing}")
-
-if data["version"] != "1.0":
-    raise SystemExit("version must equal 1.0")
-
-if data["run_id"] != expected_run_id:
-    raise SystemExit("run_id mismatch")
-
-if not re.match(r"^[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+-\d{4}-\d{2}-\d{2}-\d{3}$", data["run_id"]):
-    raise SystemExit("run_id format invalid")
-
+    raise SystemExit(f"Missing required top-level keys: {missing}")
+if data['run_id'] != expected_run_id:
+    raise SystemExit('run_id mismatch')
+if not re.match(r'^[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+-\d{4}-\d{2}-\d{2}-\d{3}$', data['run_id']):
+    raise SystemExit('run_id format invalid')
 for name in [
-    "run.log",
-    "raw.sysbench.log",
-    "raw.fio.log",
-    "raw.iperf-us-east-outbound.log",
-    "raw.iperf-us-east-inbound.log",
-    "raw.iperf-eu-west-outbound.log",
-    "raw.iperf-eu-west-inbound.log",
-    "run.md",
+    'run.log', 'raw.sysbench.log', 'raw.fio.log',
+    'raw.iperf-us-east-outbound.log', 'raw.iperf-us-east-inbound.log',
+    'raw.iperf-eu-west-outbound.log', 'raw.iperf-eu-west-inbound.log',
+    'raw.iperf-asia-outbound.log', 'raw.iperf-asia-inbound.log',
+    'run.md',
 ]:
     if not os.path.exists(os.path.join(run_dir, name)):
-        raise SystemExit(f"Missing artifact: {name}")
-
-print("run.json validation passed")
+        raise SystemExit(f'Missing artifact: {name}')
+for endpoint in ['us_east', 'eu_west', 'asia']:
+    if endpoint not in data['results']['network']:
+        raise SystemExit(f'Missing network endpoint: {endpoint}')
+print('run.json validation passed')
 PY
 }
 
 main() {
   parse_args "$@"
-  validate_inputs
   check_dependencies
+  ensure_base_dir_writable
   init_run
   detect_environment
   run_cpu
   run_storage
   run_network
+  FINISHED_AT_UTC="$(timestamp_utc)"
   write_run_md
   write_run_json
   validate_run_json
-  log "Benchmark complete: $RUN_ID"
-  log "Artifacts written to $RUN_DIR"
+  log "Completed"
+  log "Global status: ${GLOBAL_STATUS}"
+  log "Artifacts written to ${RUN_DIR}"
 }
 
 main "$@"
