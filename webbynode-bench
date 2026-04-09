@@ -444,7 +444,7 @@ detect_environment() {
   [[ -n "$CPU_MODEL" ]] || CPU_MODEL="$(awk -F: '/model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
   [[ -n "$CPU_MODEL" ]] || CPU_MODEL="unknown"
 
-  VCPU_COUNT="$(nproc --all 2>/dev/null || true)"
+  VCPU_COUNT="$(nproc 2>/dev/null || true)"
   [[ -n "$VCPU_COUNT" ]] || VCPU_COUNT="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")"
 
   local mem_kb
