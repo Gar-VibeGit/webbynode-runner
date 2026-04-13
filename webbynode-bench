@@ -305,14 +305,14 @@ update_global_status() {
 
   for s in "${statuses[@]}"; do
     case "$s" in
-      failed|failed_error|parse_error|missing)
-        GLOBAL_STATUS="error"
-        return 0
-        ;;
-      failed_busy)
+      failed_busy|failed_timeout|failed_connection|failed_incomplete|failed_error)
         if [[ "$GLOBAL_STATUS" != "error" ]]; then
           GLOBAL_STATUS="partial"
         fi
+        ;;
+      failed|parse_error|missing)
+        GLOBAL_STATUS="error"
+        return 0
         ;;
       ok|not_run)
         ;;
@@ -582,14 +582,54 @@ try:
     sent_bps = sum_sent.get("bits_per_second")
     recv_bps = sum_received.get("bits_per_second")
     if "error" in j:
-        print("ERROR\t" + str(j.get("error", "")))
+        print("ERROR	{}	{}	{}	{}".format(j.get("error", ""), remote_host, "" if sent_bps is None else sent_bps, "" if recv_bps is None else recv_bps))
     elif sent_bps is None or recv_bps is None:
         print("PARSE_ERROR")
     else:
-        print("OK\t{}\t{}\t{}".format(remote_host, sent_bps, recv_bps))
+        print("OK	{}	{}	{}".format(remote_host, sent_bps, recv_bps))
 except Exception:
     print("PARSE_ERROR")
 PY
+}
+
+classify_iperf_error_reason() {
+  local outfile="$1"
+
+  if grep -qi "server is busy" "$outfile" || grep -qi "the server is busy" "$outfile"; then
+    echo "failed_busy"
+    return 0
+  fi
+
+  if grep -qi '"error"' "$outfile"; then
+    if grep -qi "timed out" "$outfile" || grep -qi "timeout" "$outfile"; then
+      echo "failed_timeout"
+      return 0
+    fi
+
+    if grep -qi "control socket has closed unexpectedly" "$outfile"; then
+      echo "failed_connection"
+      return 0
+    fi
+
+    if grep -qi "unable to connect" "$outfile" || grep -qi "connection refused" "$outfile" || grep -qi "connection reset" "$outfile"; then
+      echo "failed_connection"
+      return 0
+    fi
+
+    echo "failed_error"
+    return 0
+  fi
+
+  if [[ -s "$outfile" ]]; then
+    echo "failed_incomplete"
+  else
+    echo "missing"
+  fi
+}
+
+iperf_result_has_error_json() {
+  local outfile="$1"
+  grep -qi '"error"' "$outfile"
 }
 
 run_iperf_with_retry() {
@@ -601,9 +641,11 @@ run_iperf_with_retry() {
   local label="$6"
   local attempt=1
   local rc=0
+  local classified=""
 
   while (( attempt <= IPERF_RETRIES_MAX )); do
-    printf '%q ' iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" ${reverse_flag:+-R} -J | sed 's/ $/\n/' > "${outfile%.log}.cmd.txt"
+    printf '%q ' iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" ${reverse_flag:+-R} -J | sed 's/ $/
+/' > "${outfile%.log}.cmd.txt"
 
     set +e
     if [[ "$reverse_flag" == "reverse" ]]; then
@@ -619,12 +661,14 @@ run_iperf_with_retry() {
     local parsed
     parsed="$(parse_iperf_json "$outfile")"
 
-    if [[ "$parsed" == OK$'\t'* ]]; then
+    if [[ "$rc" == "0" ]] && [[ "$parsed" == OK$'	'* ]] && ! iperf_result_has_error_json "$outfile"; then
       printf -v "$status_var" '%s' "ok"
       return 0
     fi
 
-    if grep -qi 'server is busy' "$outfile"; then
+    classified="$(classify_iperf_error_reason "$outfile")"
+
+    if [[ "$classified" == "failed_busy" ]]; then
       if (( attempt < IPERF_RETRIES_MAX )); then
         append_status_note "${label}=busy_retry_${attempt}"
         sleep "$IPERF_RETRY_SLEEP"
@@ -637,17 +681,14 @@ run_iperf_with_retry() {
       fi
     fi
 
-    if (( attempt < IPERF_RETRIES_MAX )); then
-      append_status_note "${label}=retry_${attempt}_rc_${rc}"
-      sleep "$IPERF_RETRY_SLEEP"
-      ((attempt++))
-      continue
-    fi
-
-    printf -v "$status_var" '%s' "failed_error"
-    append_status_note "${label}=failed_error_rc_${rc}"
+    printf -v "$status_var" '%s' "$classified"
+    append_status_note "${label}=${classified}_rc_${rc}"
     return 0
   done
+
+  printf -v "$status_var" '%s' "failed_error"
+  append_status_note "${label}=failed_error_fell_through"
+  return 0
 }
 
 capture_iperf_metrics() {
@@ -658,9 +699,15 @@ capture_iperf_metrics() {
   local parsed
 
   parsed="$(parse_iperf_json "$path")"
-  if [[ "$parsed" == OK$'\t'* ]]; then
+  if [[ "$parsed" == OK$'	'* ]]; then
     local _tag remote sent recv
-    IFS=$'\t' read -r _tag remote sent recv <<< "$parsed"
+    IFS=$'	' read -r _tag remote sent recv <<< "$parsed"
+    printf -v "$remote_var" '%s' "$remote"
+    printf -v "$sent_var" '%s' "$sent"
+    printf -v "$recv_var" '%s' "$recv"
+  elif [[ "$parsed" == ERROR$'	'* ]]; then
+    local _tag errmsg remote sent recv
+    IFS=$'	' read -r _tag errmsg remote sent recv <<< "$parsed"
     printf -v "$remote_var" '%s' "$remote"
     printf -v "$sent_var" '%s' "$sent"
     printf -v "$recv_var" '%s' "$recv"
@@ -673,27 +720,27 @@ capture_iperf_metrics() {
 
 run_network() {
   log "Running US outbound network benchmark"
-  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_OUT_LOG" "" NET_US_OUT_STATUS NET_US_OUT_RETRIES_USED "us_outbound"
+  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_OUT_LOG" "" NET_US_OUT_STATUS NET_US_OUT_RETRIES_USED "us_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_US_OUT_LOG" US_OUT_REMOTE_HOST US_OUT_SENT_BPS US_OUT_RECEIVED_BPS
 
   log "Running US inbound network benchmark"
-  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_IN_LOG" reverse NET_US_IN_STATUS NET_US_IN_RETRIES_USED "us_inbound"
+  run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_IN_LOG" reverse NET_US_IN_STATUS NET_US_IN_RETRIES_USED "us_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_US_IN_LOG" US_IN_REMOTE_HOST US_IN_SENT_BPS US_IN_RECEIVED_BPS
 
   log "Running EU outbound network benchmark"
-  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_OUT_LOG" "" NET_EU_OUT_STATUS NET_EU_OUT_RETRIES_USED "eu_outbound"
+  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_OUT_LOG" "" NET_EU_OUT_STATUS NET_EU_OUT_RETRIES_USED "eu_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_EU_OUT_LOG" EU_OUT_REMOTE_HOST EU_OUT_SENT_BPS EU_OUT_RECEIVED_BPS
 
   log "Running EU inbound network benchmark"
-  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_IN_LOG" reverse NET_EU_IN_STATUS NET_EU_IN_RETRIES_USED "eu_inbound"
+  run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_IN_LOG" reverse NET_EU_IN_STATUS NET_EU_IN_RETRIES_USED "eu_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_EU_IN_LOG" EU_IN_REMOTE_HOST EU_IN_SENT_BPS EU_IN_RECEIVED_BPS
 
   log "Running Asia outbound network benchmark"
-  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_OUT_LOG" "" NET_ASIA_OUT_STATUS NET_ASIA_OUT_RETRIES_USED "asia_outbound"
+  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_OUT_LOG" "" NET_ASIA_OUT_STATUS NET_ASIA_OUT_RETRIES_USED "asia_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_ASIA_OUT_LOG" ASIA_OUT_REMOTE_HOST ASIA_OUT_SENT_BPS ASIA_OUT_RECEIVED_BPS
 
   log "Running Asia inbound network benchmark"
-  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_IN_LOG" reverse NET_ASIA_IN_STATUS NET_ASIA_IN_RETRIES_USED "asia_inbound"
+  run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_IN_LOG" reverse NET_ASIA_IN_STATUS NET_ASIA_IN_RETRIES_USED "asia_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_ASIA_IN_LOG" ASIA_IN_REMOTE_HOST ASIA_IN_SENT_BPS ASIA_IN_RECEIVED_BPS
 }
 
