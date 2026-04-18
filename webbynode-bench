@@ -1003,8 +1003,12 @@ run_iperf_with_retry() {
   local classified=""
 
   while (( attempt <= IPERF_RETRIES_MAX )); do
-    printf '%q ' iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" ${reverse_flag:+-R} -J | sed 's/ $/
-/' > "${outfile%.log}.cmd.txt"
+    local cmd=(iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION")
+    if [[ "$reverse_flag" == "reverse" ]]; then
+      cmd+=( -R )
+    fi
+    cmd+=( -J )
+    printf '%q ' "${cmd[@]}" | sed 's/ $/\n/' > "${outfile%.log}.cmd.txt"
 
     set +e
     if [[ "$reverse_flag" == "reverse" ]]; then
@@ -1198,6 +1202,8 @@ write_run_json() {
     "$RAW_IPERF_ASIA_OUT_LOG" \
     "$RAW_IPERF_ASIA_IN_LOG" \
     "$TELEMETRY_LOG" \
+    "$TELEMETRY_STATUS" \
+    "$TELEMETRY_BACKEND" \
     "$AGENT_SIM_JSON" \
     "$RAW_AGENT_SIM_LOG" \
     "$AGENT_SIM_DURATION" \
@@ -1488,7 +1494,7 @@ obj = {
         "hostname": hostname_fqdn,
     },
     "commands": {
-        "runner": " ".join(["./webbynode-bench"] + []),
+        "runner": "./webbynode-bench",
         "cpu": read_text(os.path.join(run_dir, "cmd.sysbench.txt")),
         "storage": read_text(os.path.join(run_dir, "cmd.fio.txt")),
         "network": {
@@ -1630,7 +1636,7 @@ obj = {
         "raw_agent_sim_log": os.path.basename(raw_agent_sim_log) if os.path.exists(raw_agent_sim_log) else None,
     },
     "agent_sim": {
-        "enabled": True,
+        "enabled": agent_sim_json not in ("", "None", "null") and os.path.exists(agent_sim_json),
         "version": "agent_sim_v1" if agent_iterations_total else None,
         "duration_seconds": integer(agent_sim_duration),
         "iterations_total": integer(agent_iterations_total),
