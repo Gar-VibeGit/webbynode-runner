@@ -712,8 +712,8 @@ with open(out_log, "w", encoding="utf-8") as raw:
             blob = (f"agent-iter-{iterations}-" + "x"*1024).encode()
             for _ in range(5000):
                 hashlib.sha256(blob).hexdigest()
-            req = urllib.request.Request(f"https://{endpoint}/", headers={"User-Agent": "webbynode-agent-sim/1.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            req = urllib.request.Request(f"http://{endpoint}/ping", headers={"User-Agent": "webbynode-agent-sim/1.0"})
+            with urllib.request.urlopen(req, timeout=2) as resp:
                 resp.read(10240)
             checksum = hashlib.sha256(f"{time.time()}-{iterations}".encode()).hexdigest()
             try:
