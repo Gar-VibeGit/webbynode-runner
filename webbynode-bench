@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
 
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.1-epoch-v2-hardened
+# Version: v2.2-agent-layer-v1
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
 SCHEMA_VERSION="1.3"
-METHODOLOGY_VERSION="2.0"
+METHODOLOGY_VERSION="2.1"
 EPOCH="${MEASUREMENT_EPOCH:-v2}"
 MEASUREMENT_EPOCH="${MEASUREMENT_EPOCH:-v2}"
 
@@ -63,6 +64,59 @@ RAW_IPERF_ASIA_OUT_LOG=""
 RAW_IPERF_ASIA_IN_LOG=""
 RUN_JSON=""
 RUN_MD=""
+
+TELEMETRY_LOG=""
+AGENT_SIM_JSON=""
+RAW_AGENT_SIM_LOG=""
+TELEMETRY_STATUS="not_run"
+TELEMETRY_BACKEND=""
+AGENT_SIM_ENABLED="${AGENT_SIM_ENABLED:-1}"
+AGENT_SIM_DURATION="${AGENT_SIM_DURATION:-300}"
+TELEMETRY_SAMPLER_PID=""
+CPU_STEAL_AVG=""
+CPU_STEAL_P95=""
+CPU_STEAL_MAX=""
+CPU_STEAL_TIME_ABOVE_05=""
+IOWAIT_AVG=""
+IOWAIT_P95=""
+IOWAIT_MAX=""
+NET_US_OUT_STDDEV_BPS=""
+NET_US_OUT_P95_BPS=""
+NET_US_OUT_P99_BPS=""
+NET_US_OUT_P99_TO_P50_RATIO=""
+NET_US_IN_STDDEV_BPS=""
+NET_US_IN_P95_BPS=""
+NET_US_IN_P99_BPS=""
+NET_US_IN_P99_TO_P50_RATIO=""
+NET_EU_OUT_STDDEV_BPS=""
+NET_EU_OUT_P95_BPS=""
+NET_EU_OUT_P99_BPS=""
+NET_EU_OUT_P99_TO_P50_RATIO=""
+NET_EU_IN_STDDEV_BPS=""
+NET_EU_IN_P95_BPS=""
+NET_EU_IN_P99_BPS=""
+NET_EU_IN_P99_TO_P50_RATIO=""
+NET_ASIA_OUT_STDDEV_BPS=""
+NET_ASIA_OUT_P95_BPS=""
+NET_ASIA_OUT_P99_BPS=""
+NET_ASIA_OUT_P99_TO_P50_RATIO=""
+NET_ASIA_IN_STDDEV_BPS=""
+NET_ASIA_IN_P95_BPS=""
+NET_ASIA_IN_P99_BPS=""
+NET_ASIA_IN_P99_TO_P50_RATIO=""
+AGENT_SIM_ITERATIONS_TOTAL=""
+AGENT_SIM_ITERATIONS_SUCCESSFUL=""
+AGENT_SIM_ITERATIONS_FAILED=""
+AGENT_SIM_FAILURE_RATE=""
+AGENT_SIM_LAT_P50=""
+AGENT_SIM_LAT_P95=""
+AGENT_SIM_LAT_P99=""
+AGENT_SIM_LAT_STDDEV=""
+AGENT_SIM_START_RATE=""
+AGENT_SIM_END_RATE=""
+AGENT_SIM_THROUGHPUT_DRIFT_PERCENT=""
+AGENT_SIM_DISK_WRITE_FAILURES=""
+AGENT_SIM_DISK_CHECKSUM_FAILURES=""
 
 STARTED_AT_UTC=""
 FINISHED_AT_UTC=""
@@ -143,6 +197,8 @@ Required:
 
 Optional:
   --measurement-epoch Measurement epoch label (default: ${MEASUREMENT_EPOCH})
+  --agent-sim-enabled 1/0 to enable agent simulation run (default: ${AGENT_SIM_ENABLED})
+  --agent-sim-duration Duration in seconds for agent simulation run (default: ${AGENT_SIM_DURATION})
   --iperf-parallel   iperf3 parallel streams (default: ${IPERF_PARALLEL})
   --iperf-duration   iperf3 duration seconds (default: ${IPERF_DURATION})
   -h, --help         Show help
@@ -326,6 +382,7 @@ update_global_status() {
 
 cleanup_on_error() {
   local exit_code=$?
+  stop_telemetry_sampler || true
   FINISHED_AT_UTC="$(timestamp_utc)"
   GLOBAL_STATUS="error"
   append_status_note "runner_exit_code=${exit_code}"
@@ -371,6 +428,14 @@ parse_args() {
         EPOCH="${MEASUREMENT_EPOCH}"
         shift 2
         ;;
+      --agent-sim-enabled)
+        AGENT_SIM_ENABLED="${2:-}"
+        shift 2
+        ;;
+      --agent-sim-duration)
+        AGENT_SIM_DURATION="${2:-}"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -388,6 +453,8 @@ parse_args() {
 
   [[ "$IPERF_PARALLEL" =~ ^[0-9]+$ ]] || die "--iperf-parallel must be an integer"
   [[ "$IPERF_DURATION" =~ ^[0-9]+$ ]] || die "--iperf-duration must be an integer"
+  [[ "$AGENT_SIM_ENABLED" =~ ^[01]$ ]] || die "--agent-sim-enabled must be 0 or 1"
+  [[ "$AGENT_SIM_DURATION" =~ ^[0-9]+$ ]] || die "--agent-sim-duration must be an integer"
   validate_price || die "--price must be a non-negative number"
 }
 
@@ -406,6 +473,8 @@ check_dependencies() {
   require_cmd sysbench
   require_cmd fio
   require_cmd iperf3
+  require_cmd curl
+  require_cmd sha256sum
 }
 
 init_run() {
@@ -431,6 +500,9 @@ init_run() {
   RAW_IPERF_ASIA_IN_LOG="${RUN_DIR}/raw.iperf-asia-inbound.log"
   RUN_JSON="${RUN_DIR}/run.json"
   RUN_MD="${RUN_DIR}/run.md"
+  TELEMETRY_LOG="${RUN_DIR}/telemetry.log"
+  AGENT_SIM_JSON="${RUN_DIR}/agent-sim.json"
+  RAW_AGENT_SIM_LOG="${RUN_DIR}/raw.agent-sim.log"
 
   STARTED_AT_UTC="$(timestamp_utc)"
   exec > >(tee -a "$RUN_LOG") 2>&1
@@ -463,8 +535,291 @@ detect_environment() {
   fi
 }
 
+
+start_telemetry_sampler() {
+  : > "$TELEMETRY_LOG"
+  if command -v mpstat >/dev/null 2>&1; then
+    TELEMETRY_STATUS="ok"
+    TELEMETRY_BACKEND="mpstat"
+    (
+      while true; do
+        mpstat 1 1 2>/dev/null | awk '/Average:/ && $2 ~ /all/ {print strftime("%s"), $(NF), $(NF-4); fflush(); }' >> "$TELEMETRY_LOG"
+      done
+    ) &
+    TELEMETRY_SAMPLER_PID=$!
+    log "Telemetry sampler started with mpstat"
+  else
+    TELEMETRY_STATUS="not_available"
+    TELEMETRY_BACKEND=""
+    append_status_note "Telemetry not available: mpstat/sysstat not installed"
+    log "mpstat not found; telemetry sampler disabled"
+    TELEMETRY_SAMPLER_PID=""
+  fi
+}
+
+stop_telemetry_sampler() {
+  if [[ -n "${TELEMETRY_SAMPLER_PID:-}" ]]; then
+    kill "$TELEMETRY_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$TELEMETRY_SAMPLER_PID" 2>/dev/null || true
+    TELEMETRY_SAMPLER_PID=""
+    log "Telemetry sampler stopped"
+  fi
+}
+
+parse_telemetry_metrics() {
+  if [[ ! -s "$TELEMETRY_LOG" ]]; then
+    [[ "$TELEMETRY_STATUS" == "ok" ]] && TELEMETRY_STATUS="empty"
+    return 0
+  fi
+
+  local parsed
+  parsed="$(python3 - "$TELEMETRY_LOG" <<'PY'
+import math, sys
+from statistics import mean
+path = sys.argv[1]
+steal = []
+iowait = []
+with open(path, 'r', encoding='utf-8', errors='replace') as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        try:
+            steal.append(float(parts[1]))
+            iowait.append(float(parts[2]))
+        except Exception:
+            pass
+def pct(vals, q):
+    if not vals:
+        return ""
+    vals = sorted(vals)
+    idx = max(0, min(len(vals)-1, math.ceil(q * len(vals)) - 1))
+    return vals[idx]
+def fmt(v):
+    return "" if v == "" else f"{v:.4f}"
+time_above = 0.0
+if steal:
+    time_above = sum(1 for x in steal if x > 0.5) / len(steal) * 100.0
+vals = [
+    fmt(mean(steal)) if steal else "",
+    fmt(pct(steal, 0.95)),
+    fmt(max(steal)) if steal else "",
+    fmt(time_above) if steal else "",
+    fmt(mean(iowait)) if iowait else "",
+    fmt(pct(iowait, 0.95)),
+    fmt(max(iowait)) if iowait else "",
+]
+print("\t".join(vals))
+PY
+)"
+  IFS=$'\t' read -r CPU_STEAL_AVG CPU_STEAL_P95 CPU_STEAL_MAX CPU_STEAL_TIME_ABOVE_05 IOWAIT_AVG IOWAIT_P95 IOWAIT_MAX <<< "$parsed"
+}
+
+parse_iperf_interval_metrics() {
+  local path="$1"
+  python3 - "$path" <<'PY'
+import json, math, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        j = json.load(f)
+except Exception:
+    print("\t\t\t")
+    raise SystemExit(0)
+values = []
+for interval in j.get("intervals", []):
+    streams = interval.get("streams", [])
+    if streams:
+        vals = [s.get("bits_per_second") for s in streams if s.get("bits_per_second") is not None]
+        if vals:
+            values.append(sum(vals))
+            continue
+    sums = interval.get("sum")
+    if isinstance(sums, dict) and sums.get("bits_per_second") is not None:
+        values.append(sums.get("bits_per_second"))
+if not values:
+    print("\t\t\t")
+    raise SystemExit(0)
+values = sorted(float(v) for v in values)
+n = len(values)
+def pct(q):
+    idx = max(0, min(n-1, math.ceil(q*n)-1))
+    return values[idx]
+avg = sum(values)/n
+std = (sum((v-avg)**2 for v in values)/n) ** 0.5
+p50 = pct(0.50)
+p95 = pct(0.95)
+p99 = pct(0.99)
+ratio = (p99 / p50) if p50 else None
+def fmt(v):
+    return "" if v is None else f"{v:.4f}"
+print("\t".join([fmt(std), fmt(p95), fmt(p99), fmt(ratio)]))
+PY
+}
+
+capture_iperf_variance_metrics() {
+  local path="$1"
+  local std_var="$2"
+  local p95_var="$3"
+  local p99_var="$4"
+  local ratio_var="$5"
+  local parsed
+  parsed="$(parse_iperf_interval_metrics "$path")"
+  IFS=$'\t' read -r _std _p95 _p99 _ratio <<< "$parsed"
+  printf -v "$std_var" '%s' "${_std:-}"
+  printf -v "$p95_var" '%s' "${_p95:-}"
+  printf -v "$p99_var" '%s' "${_p99:-}"
+  printf -v "$ratio_var" '%s' "${_ratio:-}"
+}
+
+run_agent_sim() {
+  if [[ "$AGENT_SIM_ENABLED" != "1" ]]; then
+    log "Agent simulation disabled"
+    return 0
+  fi
+
+  log "Running agent simulation v1"
+  python3 - "$AGENT_SIM_JSON" "$RAW_AGENT_SIM_LOG" "$AGENT_SIM_DURATION" "$US_ENDPOINT" "$RUN_DIR/agent.db" "$RUN_DIR/agent.log" <<'PY'
+import hashlib, json, math, os, sqlite3, statistics, sys, time, urllib.request
+out_json, out_log, duration_s, endpoint, db_path, log_path = sys.argv[1:]
+duration_s = int(duration_s)
+start = time.time()
+deadline = start + duration_s
+iterations = 0
+successful = 0
+failed = 0
+latencies = []
+disk_write_failures = 0
+disk_checksum_failures = 0
+window = []
+start_window = []
+end_window = []
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY, payload TEXT)")
+if cur.execute("SELECT COUNT(*) FROM kv").fetchone()[0] == 0:
+    cur.executemany("INSERT INTO kv (payload) VALUES (?)", [(f'payload-{i}',) for i in range(1000)])
+    conn.commit()
+with open(out_log, "w", encoding="utf-8") as raw:
+    while time.time() < deadline:
+        iter_start = time.time()
+        ok = True
+        try:
+            ids = [((iterations * 17 + i * 13) % 1000) + 1 for i in range(25)]
+            for row_id in ids:
+                cur.execute("SELECT payload FROM kv WHERE id=?", (row_id,))
+                cur.fetchone()
+            blob = (f"agent-iter-{iterations}-" + "x"*1024).encode()
+            for _ in range(5000):
+                hashlib.sha256(blob).hexdigest()
+            req = urllib.request.Request(f"https://{endpoint}/", headers={"User-Agent": "webbynode-agent-sim/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read(10240)
+            checksum = hashlib.sha256(f"{time.time()}-{iterations}".encode()).hexdigest()
+            try:
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(checksum + "\n")
+                    lf.flush()
+                    os.fsync(lf.fileno())
+                if hashlib.sha256((checksum + "\n").encode()).hexdigest() == "":
+                    disk_checksum_failures += 1
+            except Exception:
+                ok = False
+                disk_write_failures += 1
+        except Exception as exc:
+            ok = False
+            raw.write(f"ITER {iterations} ERROR {type(exc).__name__}: {exc}\n")
+        iter_end = time.time()
+        latency_ms = (iter_end - iter_start) * 1000.0
+        latencies.append(latency_ms)
+        iterations += 1
+        if ok:
+            successful += 1
+        else:
+            failed += 1
+        elapsed = iter_end - start
+        if elapsed <= min(60, duration_s/2):
+            start_window.append(latency_ms)
+        if deadline - iter_end <= min(60, duration_s/2):
+            end_window.append(latency_ms)
+        raw.write(f"ITER {iterations} {'OK' if ok else 'FAIL'} latency_ms={latency_ms:.3f}\n")
+        raw.flush()
+        time.sleep(0.2)
+conn.close()
+def pct(vals, q):
+    if not vals:
+        return None
+    vals = sorted(vals)
+    idx = max(0, min(len(vals)-1, math.ceil(q*len(vals))-1))
+    return vals[idx]
+def rate(lat_vals):
+    if not lat_vals:
+        return None
+    avg_ms = sum(lat_vals)/len(lat_vals)
+    return 1000.0/avg_ms if avg_ms > 0 else None
+failure_rate = (failed / iterations) if iterations else None
+start_rate = rate(start_window)
+end_rate = rate(end_window)
+drift = (abs(end_rate - start_rate) / start_rate * 100.0) if start_rate and end_rate else None
+obj = {
+    "version": "agent_sim_v1",
+    "duration_seconds": duration_s,
+    "iterations_total": iterations,
+    "iterations_successful": successful,
+    "iterations_failed": failed,
+    "failure_rate": failure_rate,
+    "latency_ms": {
+        "p50": pct(latencies, 0.50),
+        "p95": pct(latencies, 0.95),
+        "p99": pct(latencies, 0.99),
+        "stddev": statistics.pstdev(latencies) if latencies else None,
+    },
+    "iterations_per_second": {
+        "start_window": start_rate,
+        "end_window": end_rate,
+    },
+    "throughput_drift_percent": drift,
+    "disk": {
+        "write_failures": disk_write_failures,
+        "checksum_failures": disk_checksum_failures,
+    },
+}
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(obj, f, indent=2)
+    f.write("\n")
+PY
+
+  if [[ -f "$AGENT_SIM_JSON" ]]; then
+    local parsed
+    parsed="$(python3 - "$AGENT_SIM_JSON" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    j = json.load(f)
+vals = [
+    j.get("iterations_total"),
+    j.get("iterations_successful"),
+    j.get("iterations_failed"),
+    j.get("failure_rate"),
+    j.get("latency_ms", {}).get("p50"),
+    j.get("latency_ms", {}).get("p95"),
+    j.get("latency_ms", {}).get("p99"),
+    j.get("latency_ms", {}).get("stddev"),
+    j.get("iterations_per_second", {}).get("start_window"),
+    j.get("iterations_per_second", {}).get("end_window"),
+    j.get("throughput_drift_percent"),
+    j.get("disk", {}).get("write_failures"),
+    j.get("disk", {}).get("checksum_failures"),
+]
+print("\t".join("" if v is None else str(v) for v in vals))
+PY
+)"
+    IFS=$'\t' read -r AGENT_SIM_ITERATIONS_TOTAL AGENT_SIM_ITERATIONS_SUCCESSFUL AGENT_SIM_ITERATIONS_FAILED AGENT_SIM_FAILURE_RATE AGENT_SIM_LAT_P50 AGENT_SIM_LAT_P95 AGENT_SIM_LAT_P99 AGENT_SIM_LAT_STDDEV AGENT_SIM_START_RATE AGENT_SIM_END_RATE AGENT_SIM_THROUGHPUT_DRIFT_PERCENT AGENT_SIM_DISK_WRITE_FAILURES AGENT_SIM_DISK_CHECKSUM_FAILURES <<< "$parsed"
+  fi
+}
+
 run_cpu() {
   log "Running CPU benchmark"
+  start_telemetry_sampler
   local cmd=(
     sysbench cpu
     --threads="${SYSBENCH_THREADS_OVERRIDE}"
@@ -485,6 +840,8 @@ run_cpu() {
   else
     CPU_STATUS="failed"
     append_status_note "cpu=failed"
+    stop_telemetry_sampler
+    parse_telemetry_metrics
     return 0
   fi
 
@@ -492,6 +849,8 @@ run_cpu() {
   CPU_LAT_AVG="$(awk '/avg:/ {print $2; exit}' "$RAW_SYSBENCH_LOG")"
   CPU_LAT_P95="$(awk '/95th percentile:/ {print $3; exit}' "$RAW_SYSBENCH_LOG")"
   CPU_LAT_P99=""
+  stop_telemetry_sampler
+  parse_telemetry_metrics
 }
 
 run_storage() {
@@ -722,26 +1081,32 @@ run_network() {
   log "Running US outbound network benchmark"
   run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_OUT_LOG" "" NET_US_OUT_STATUS NET_US_OUT_RETRIES_USED "us_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_US_OUT_LOG" US_OUT_REMOTE_HOST US_OUT_SENT_BPS US_OUT_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_US_OUT_LOG" NET_US_OUT_STDDEV_BPS NET_US_OUT_P95_BPS NET_US_OUT_P99_BPS NET_US_OUT_P99_TO_P50_RATIO
 
   log "Running US inbound network benchmark"
   run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_IN_LOG" reverse NET_US_IN_STATUS NET_US_IN_RETRIES_USED "us_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_US_IN_LOG" US_IN_REMOTE_HOST US_IN_SENT_BPS US_IN_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_US_IN_LOG" NET_US_IN_STDDEV_BPS NET_US_IN_P95_BPS NET_US_IN_P99_BPS NET_US_IN_P99_TO_P50_RATIO
 
   log "Running EU outbound network benchmark"
   run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_OUT_LOG" "" NET_EU_OUT_STATUS NET_EU_OUT_RETRIES_USED "eu_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_EU_OUT_LOG" EU_OUT_REMOTE_HOST EU_OUT_SENT_BPS EU_OUT_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_EU_OUT_LOG" NET_EU_OUT_STDDEV_BPS NET_EU_OUT_P95_BPS NET_EU_OUT_P99_BPS NET_EU_OUT_P99_TO_P50_RATIO
 
   log "Running EU inbound network benchmark"
   run_iperf_with_retry "$EU_ENDPOINT" "$RAW_IPERF_EU_IN_LOG" reverse NET_EU_IN_STATUS NET_EU_IN_RETRIES_USED "eu_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_EU_IN_LOG" EU_IN_REMOTE_HOST EU_IN_SENT_BPS EU_IN_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_EU_IN_LOG" NET_EU_IN_STDDEV_BPS NET_EU_IN_P95_BPS NET_EU_IN_P99_BPS NET_EU_IN_P99_TO_P50_RATIO
 
   log "Running Asia outbound network benchmark"
   run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_OUT_LOG" "" NET_ASIA_OUT_STATUS NET_ASIA_OUT_RETRIES_USED "asia_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_ASIA_OUT_LOG" ASIA_OUT_REMOTE_HOST ASIA_OUT_SENT_BPS ASIA_OUT_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_ASIA_OUT_LOG" NET_ASIA_OUT_STDDEV_BPS NET_ASIA_OUT_P95_BPS NET_ASIA_OUT_P99_BPS NET_ASIA_OUT_P99_TO_P50_RATIO
 
   log "Running Asia inbound network benchmark"
   run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_IN_LOG" reverse NET_ASIA_IN_STATUS NET_ASIA_IN_RETRIES_USED "asia_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_ASIA_IN_LOG" ASIA_IN_REMOTE_HOST ASIA_IN_SENT_BPS ASIA_IN_RECEIVED_BPS
+  capture_iperf_variance_metrics "$RAW_IPERF_ASIA_IN_LOG" NET_ASIA_IN_STDDEV_BPS NET_ASIA_IN_P95_BPS NET_ASIA_IN_P99_BPS NET_ASIA_IN_P99_TO_P50_RATIO
 }
 
 write_run_md() {
@@ -787,6 +1152,9 @@ write_run_md() {
 - raw.iperf-eu-west-inbound.log
 - raw.iperf-asia-outbound.log
 - raw.iperf-asia-inbound.log
+- telemetry.log (if mpstat available)
+- agent-sim.json (if enabled)
+- raw.agent-sim.log (if enabled)
 - run.json
 EOF2
 }
@@ -829,6 +1197,10 @@ write_run_json() {
     "$RAW_IPERF_EU_IN_LOG" \
     "$RAW_IPERF_ASIA_OUT_LOG" \
     "$RAW_IPERF_ASIA_IN_LOG" \
+    "$TELEMETRY_LOG" \
+    "$AGENT_SIM_JSON" \
+    "$RAW_AGENT_SIM_LOG" \
+    "$AGENT_SIM_DURATION" \
     "$RUN_MD" \
     "$CPU_STATUS" \
     "$STORAGE_STATUS" \
@@ -875,7 +1247,51 @@ write_run_json() {
     "$ASIA_OUT_RECEIVED_BPS" \
     "$ASIA_IN_REMOTE_HOST" \
     "$ASIA_IN_SENT_BPS" \
-    "$ASIA_IN_RECEIVED_BPS" <<'PY'
+    "$ASIA_IN_RECEIVED_BPS" \
+    "$CPU_STEAL_AVG" \
+    "$CPU_STEAL_P95" \
+    "$CPU_STEAL_MAX" \
+    "$CPU_STEAL_TIME_ABOVE_05" \
+    "$IOWAIT_AVG" \
+    "$IOWAIT_P95" \
+    "$IOWAIT_MAX" \
+    "$NET_US_OUT_STDDEV_BPS" \
+    "$NET_US_OUT_P95_BPS" \
+    "$NET_US_OUT_P99_BPS" \
+    "$NET_US_OUT_P99_TO_P50_RATIO" \
+    "$NET_US_IN_STDDEV_BPS" \
+    "$NET_US_IN_P95_BPS" \
+    "$NET_US_IN_P99_BPS" \
+    "$NET_US_IN_P99_TO_P50_RATIO" \
+    "$NET_EU_OUT_STDDEV_BPS" \
+    "$NET_EU_OUT_P95_BPS" \
+    "$NET_EU_OUT_P99_BPS" \
+    "$NET_EU_OUT_P99_TO_P50_RATIO" \
+    "$NET_EU_IN_STDDEV_BPS" \
+    "$NET_EU_IN_P95_BPS" \
+    "$NET_EU_IN_P99_BPS" \
+    "$NET_EU_IN_P99_TO_P50_RATIO" \
+    "$NET_ASIA_OUT_STDDEV_BPS" \
+    "$NET_ASIA_OUT_P95_BPS" \
+    "$NET_ASIA_OUT_P99_BPS" \
+    "$NET_ASIA_OUT_P99_TO_P50_RATIO" \
+    "$NET_ASIA_IN_STDDEV_BPS" \
+    "$NET_ASIA_IN_P95_BPS" \
+    "$NET_ASIA_IN_P99_BPS" \
+    "$NET_ASIA_IN_P99_TO_P50_RATIO" \
+    "$AGENT_SIM_ITERATIONS_TOTAL" \
+    "$AGENT_SIM_ITERATIONS_SUCCESSFUL" \
+    "$AGENT_SIM_ITERATIONS_FAILED" \
+    "$AGENT_SIM_FAILURE_RATE" \
+    "$AGENT_SIM_LAT_P50" \
+    "$AGENT_SIM_LAT_P95" \
+    "$AGENT_SIM_LAT_P99" \
+    "$AGENT_SIM_LAT_STDDEV" \
+    "$AGENT_SIM_START_RATE" \
+    "$AGENT_SIM_END_RATE" \
+    "$AGENT_SIM_THROUGHPUT_DRIFT_PERCENT" \
+    "$AGENT_SIM_DISK_WRITE_FAILURES" \
+    "$AGENT_SIM_DISK_CHECKSUM_FAILURES" <<'PY'
 import json, os, sys
 (
   out_path,
@@ -912,6 +1328,12 @@ import json, os, sys
   raw_iperf_eu_in_log,
   raw_iperf_asia_out_log,
   raw_iperf_asia_in_log,
+  telemetry_log,
+  telemetry_status,
+  telemetry_backend,
+  agent_sim_json,
+  raw_agent_sim_log,
+  agent_sim_duration,
   run_md,
   cpu_status,
   storage_status,
@@ -959,6 +1381,50 @@ import json, os, sys
   asia_in_remote_host,
   asia_in_sent_bps,
   asia_in_received_bps,
+  cpu_steal_avg,
+  cpu_steal_p95,
+  cpu_steal_max,
+  cpu_steal_time_above_05,
+  iowait_avg,
+  iowait_p95,
+  iowait_max,
+  net_us_out_stddev_bps,
+  net_us_out_p95_bps,
+  net_us_out_p99_bps,
+  net_us_out_p99_to_p50_ratio,
+  net_us_in_stddev_bps,
+  net_us_in_p95_bps,
+  net_us_in_p99_bps,
+  net_us_in_p99_to_p50_ratio,
+  net_eu_out_stddev_bps,
+  net_eu_out_p95_bps,
+  net_eu_out_p99_bps,
+  net_eu_out_p99_to_p50_ratio,
+  net_eu_in_stddev_bps,
+  net_eu_in_p95_bps,
+  net_eu_in_p99_bps,
+  net_eu_in_p99_to_p50_ratio,
+  net_asia_out_stddev_bps,
+  net_asia_out_p95_bps,
+  net_asia_out_p99_bps,
+  net_asia_out_p99_to_p50_ratio,
+  net_asia_in_stddev_bps,
+  net_asia_in_p95_bps,
+  net_asia_in_p99_bps,
+  net_asia_in_p99_to_p50_ratio,
+  agent_iterations_total,
+  agent_iterations_successful,
+  agent_iterations_failed,
+  agent_failure_rate,
+  agent_lat_p50,
+  agent_lat_p95,
+  agent_lat_p99,
+  agent_lat_stddev,
+  agent_start_rate,
+  agent_end_rate,
+  agent_throughput_drift_percent,
+  agent_disk_write_failures,
+  agent_disk_checksum_failures,
 ) = sys.argv[1:]
 
 def num(v):
@@ -1034,6 +1500,66 @@ obj = {
             "asia_inbound": read_text(raw_iperf_asia_in_log.replace('.log', '.cmd.txt')),
         },
     },
+
+    "telemetry": {
+        "status": telemetry_status,
+        "backend": telemetry_backend or None,
+        "cpu_steal": {
+            "avg_percent": num(cpu_steal_avg),
+            "p95_percent": num(cpu_steal_p95),
+            "max_percent": num(cpu_steal_max),
+            "time_above_0_5_percent": num(cpu_steal_time_above_05),
+        },
+        "iowait": {
+            "avg_percent": num(iowait_avg),
+            "p95_percent": num(iowait_p95),
+            "max_percent": num(iowait_max),
+        },
+        "network_variance": {
+            "us_east": {
+                "outbound": {
+                    "stddev_bps": num(net_us_out_stddev_bps),
+                    "p95_bps": num(net_us_out_p95_bps),
+                    "p99_bps": num(net_us_out_p99_bps),
+                    "p99_to_p50_ratio": num(net_us_out_p99_to_p50_ratio),
+                },
+                "inbound": {
+                    "stddev_bps": num(net_us_in_stddev_bps),
+                    "p95_bps": num(net_us_in_p95_bps),
+                    "p99_bps": num(net_us_in_p99_bps),
+                    "p99_to_p50_ratio": num(net_us_in_p99_to_p50_ratio),
+                },
+            },
+            "eu_west": {
+                "outbound": {
+                    "stddev_bps": num(net_eu_out_stddev_bps),
+                    "p95_bps": num(net_eu_out_p95_bps),
+                    "p99_bps": num(net_eu_out_p99_bps),
+                    "p99_to_p50_ratio": num(net_eu_out_p99_to_p50_ratio),
+                },
+                "inbound": {
+                    "stddev_bps": num(net_eu_in_stddev_bps),
+                    "p95_bps": num(net_eu_in_p95_bps),
+                    "p99_bps": num(net_eu_in_p99_bps),
+                    "p99_to_p50_ratio": num(net_eu_in_p99_to_p50_ratio),
+                },
+            },
+            "asia": {
+                "outbound": {
+                    "stddev_bps": num(net_asia_out_stddev_bps),
+                    "p95_bps": num(net_asia_out_p95_bps),
+                    "p99_bps": num(net_asia_out_p99_bps),
+                    "p99_to_p50_ratio": num(net_asia_out_p99_to_p50_ratio),
+                },
+                "inbound": {
+                    "stddev_bps": num(net_asia_in_stddev_bps),
+                    "p95_bps": num(net_asia_in_p95_bps),
+                    "p99_bps": num(net_asia_in_p99_bps),
+                    "p99_to_p50_ratio": num(net_asia_in_p99_to_p50_ratio),
+                },
+            },
+        },
+    },
     "results": {
         "cpu": {
             "status": cpu_status,
@@ -1099,6 +1625,33 @@ obj = {
         "raw_iperf_eu_in_log": os.path.basename(raw_iperf_eu_in_log),
         "raw_iperf_asia_out_log": os.path.basename(raw_iperf_asia_out_log),
         "raw_iperf_asia_in_log": os.path.basename(raw_iperf_asia_in_log),
+        "telemetry_log": os.path.basename(telemetry_log) if telemetry_log else None,
+        "agent_sim_json": os.path.basename(agent_sim_json) if os.path.exists(agent_sim_json) else None,
+        "raw_agent_sim_log": os.path.basename(raw_agent_sim_log) if os.path.exists(raw_agent_sim_log) else None,
+    },
+    "agent_sim": {
+        "enabled": True,
+        "version": "agent_sim_v1" if agent_iterations_total else None,
+        "duration_seconds": integer(agent_sim_duration),
+        "iterations_total": integer(agent_iterations_total),
+        "iterations_successful": integer(agent_iterations_successful),
+        "iterations_failed": integer(agent_iterations_failed),
+        "failure_rate": num(agent_failure_rate),
+        "latency_ms": {
+            "p50": num(agent_lat_p50),
+            "p95": num(agent_lat_p95),
+            "p99": num(agent_lat_p99),
+            "stddev": num(agent_lat_stddev),
+        },
+        "iterations_per_second": {
+            "start_window": num(agent_start_rate),
+            "end_window": num(agent_end_rate),
+        },
+        "throughput_drift_percent": num(agent_throughput_drift_percent),
+        "disk": {
+            "write_failures": integer(agent_disk_write_failures),
+            "checksum_failures": integer(agent_disk_checksum_failures),
+        },
     },
     "status_notes": [line for line in status_notes_blob.splitlines() if line.strip()],
     "timestamps": {
@@ -1158,6 +1711,7 @@ main() {
   run_cpu
   run_storage
   run_network
+  run_agent_sim
   FINISHED_AT_UTC="$(timestamp_utc)"
   write_run_md
   write_run_json
