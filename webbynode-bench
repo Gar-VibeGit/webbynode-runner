@@ -72,6 +72,7 @@ TELEMETRY_STATUS="not_run"
 TELEMETRY_BACKEND=""
 AGENT_SIM_ENABLED="${AGENT_SIM_ENABLED:-1}"
 AGENT_SIM_DURATION="${AGENT_SIM_DURATION:-300}"
+AGENT_SIM_WINDOW_PERCENT="10"
 TELEMETRY_SAMPLER_PID=""
 CPU_STEAL_AVG=""
 CPU_STEAL_P95=""
@@ -117,6 +118,12 @@ AGENT_SIM_END_RATE=""
 AGENT_SIM_THROUGHPUT_DRIFT_PERCENT=""
 AGENT_SIM_DISK_WRITE_FAILURES=""
 AGENT_SIM_DISK_CHECKSUM_FAILURES=""
+AGENT_SIM_LAT_START_AVG=""
+AGENT_SIM_LAT_END_AVG=""
+AGENT_SIM_LAT_START_P95=""
+AGENT_SIM_LAT_END_P95=""
+AGENT_SIM_FAILURE_COUNT=""
+AGENT_SIM_DRIFT_PERCENT=""
 
 STARTED_AT_UTC=""
 FINISHED_AT_UTC=""
@@ -679,21 +686,20 @@ run_agent_sim() {
   fi
 
   log "Running agent simulation v1"
-  python3 - "$AGENT_SIM_JSON" "$RAW_AGENT_SIM_LOG" "$AGENT_SIM_DURATION" "$US_ENDPOINT" "$RUN_DIR/agent.db" "$RUN_DIR/agent.log" <<'PY'
+  python3 - "$AGENT_SIM_JSON" "$RAW_AGENT_SIM_LOG" "$AGENT_SIM_DURATION" "$US_ENDPOINT" "$RUN_DIR/agent.db" "$RUN_DIR/agent.log" "$AGENT_SIM_WINDOW_PERCENT" <<'PY'
 import hashlib, json, math, os, sqlite3, statistics, sys, time, urllib.request
-out_json, out_log, duration_s, endpoint, db_path, log_path = sys.argv[1:]
+out_json, out_log, duration_s, endpoint, db_path, log_path, window_pct = sys.argv[1:]
 duration_s = int(duration_s)
+window_pct = int(window_pct)
 start = time.time()
 deadline = start + duration_s
 iterations = 0
 successful = 0
 failed = 0
 latencies = []
+successful_latencies = []
 disk_write_failures = 0
 disk_checksum_failures = 0
-window = []
-start_window = []
-end_window = []
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY, payload TEXT)")
@@ -702,8 +708,10 @@ if cur.execute("SELECT COUNT(*) FROM kv").fetchone()[0] == 0:
     conn.commit()
 with open(out_log, "w", encoding="utf-8") as raw:
     while time.time() < deadline:
-        iter_start = time.time()
+        iter_started_at = time.time()
         ok = True
+        error_type = None
+        error_message = None
         try:
             ids = [((iterations * 17 + i * 13) % 1000) + 1 for i in range(25)]
             for row_id in ids:
@@ -714,7 +722,12 @@ with open(out_log, "w", encoding="utf-8") as raw:
                 hashlib.sha256(blob).hexdigest()
             req = urllib.request.Request(f"http://{endpoint}/ping", headers={"User-Agent": "webbynode-agent-sim/1.0"})
             with urllib.request.urlopen(req, timeout=2) as resp:
+                status_code = getattr(resp, "status", 200)
                 resp.read(10240)
+                if status_code != 200:
+                    ok = False
+                    error_type = "HTTPStatus"
+                    error_message = f"status={status_code}"
             checksum = hashlib.sha256(f"{time.time()}-{iterations}".encode()).hexdigest()
             try:
                 with open(log_path, "a", encoding="utf-8") as lf:
@@ -723,26 +736,36 @@ with open(out_log, "w", encoding="utf-8") as raw:
                     os.fsync(lf.fileno())
                 if hashlib.sha256((checksum + "\n").encode()).hexdigest() == "":
                     disk_checksum_failures += 1
-            except Exception:
+            except Exception as exc:
                 ok = False
+                error_type = type(exc).__name__
+                error_message = str(exc)
                 disk_write_failures += 1
         except Exception as exc:
             ok = False
-            raw.write(f"ITER {iterations} ERROR {type(exc).__name__}: {exc}\n")
-        iter_end = time.time()
-        latency_ms = (iter_end - iter_start) * 1000.0
+            error_type = type(exc).__name__
+            error_message = str(exc)
+        iter_finished_at = time.time()
+        latency_ms = (iter_finished_at - iter_started_at) * 1000.0
         latencies.append(latency_ms)
-        iterations += 1
         if ok:
+            successful_latencies.append(latency_ms)
             successful += 1
         else:
             failed += 1
-        elapsed = iter_end - start
-        if elapsed <= min(60, duration_s/2):
-            start_window.append(latency_ms)
-        if deadline - iter_end <= min(60, duration_s/2):
-            end_window.append(latency_ms)
-        raw.write(f"ITER {iterations} {'OK' if ok else 'FAIL'} latency_ms={latency_ms:.3f}\n")
+        iterations += 1
+        event = {
+            "iteration_index": iterations - 1,
+            "iteration_number": iterations,
+            "started_at_unix": round(iter_started_at, 6),
+            "finished_at_unix": round(iter_finished_at, 6),
+            "success": ok,
+            "latency_ms": round(latency_ms, 3),
+            "status": "ok" if ok else "fail",
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        raw.write(json.dumps(event, separators=(",", ":")) + "\n")
         raw.flush()
         time.sleep(0.2)
 conn.close()
@@ -757,10 +780,20 @@ def rate(lat_vals):
         return None
     avg_ms = sum(lat_vals)/len(lat_vals)
     return 1000.0/avg_ms if avg_ms > 0 else None
+def mean(vals):
+    return (sum(vals) / len(vals)) if vals else None
+window_count = max(1, math.ceil(len(successful_latencies) * (window_pct / 100.0))) if successful_latencies else 0
+start_window = successful_latencies[:window_count]
+end_window = successful_latencies[-window_count:] if window_count else []
+start_avg = mean(start_window)
+end_avg = mean(end_window)
+start_p95 = pct(start_window, 0.95)
+end_p95 = pct(end_window, 0.95)
 failure_rate = (failed / iterations) if iterations else None
 start_rate = rate(start_window)
 end_rate = rate(end_window)
-drift = (abs(end_rate - start_rate) / start_rate * 100.0) if start_rate and end_rate else None
+throughput_drift = (abs(end_rate - start_rate) / start_rate * 100.0) if start_rate and end_rate else None
+latency_drift = (((end_avg - start_avg) / start_avg) * 100.0) if start_avg and end_avg else None
 obj = {
     "version": "agent_sim_v1",
     "duration_seconds": duration_s,
@@ -768,6 +801,7 @@ obj = {
     "iterations_successful": successful,
     "iterations_failed": failed,
     "failure_rate": failure_rate,
+    "failure_count": failed,
     "latency_ms": {
         "p50": pct(latencies, 0.50),
         "p95": pct(latencies, 0.95),
@@ -778,15 +812,32 @@ obj = {
         "start_window": start_rate,
         "end_window": end_rate,
     },
-    "throughput_drift_percent": drift,
+    "throughput_drift_percent": throughput_drift,
     "disk": {
         "write_failures": disk_write_failures,
         "checksum_failures": disk_checksum_failures,
+    },
+    "instrumentation": {
+        "agent_sim_v1": {
+            "window_definition": {
+                "successful_task_window_percent": window_pct,
+                "successful_task_window_count": window_count,
+            },
+            "metrics": {
+                "latency_start_avg_ms": start_avg,
+                "latency_end_avg_ms": end_avg,
+                "latency_start_p95_ms": start_p95,
+                "latency_end_p95_ms": end_p95,
+                "failure_count": failed,
+                "drift_percent": latency_drift,
+            },
+        }
     },
 }
 with open(out_json, "w", encoding="utf-8") as f:
     json.dump(obj, f, indent=2)
     f.write("\n")
+PY
 PY
 
   if [[ -f "$AGENT_SIM_JSON" ]]; then
@@ -809,11 +860,17 @@ vals = [
     j.get("throughput_drift_percent"),
     j.get("disk", {}).get("write_failures"),
     j.get("disk", {}).get("checksum_failures"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("latency_start_avg_ms"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("latency_end_avg_ms"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("latency_start_p95_ms"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("latency_end_p95_ms"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("failure_count"),
+    j.get("instrumentation", {}).get("agent_sim_v1", {}).get("metrics", {}).get("drift_percent"),
 ]
 print("\t".join("" if v is None else str(v) for v in vals))
 PY
 )"
-    IFS=$'\t' read -r AGENT_SIM_ITERATIONS_TOTAL AGENT_SIM_ITERATIONS_SUCCESSFUL AGENT_SIM_ITERATIONS_FAILED AGENT_SIM_FAILURE_RATE AGENT_SIM_LAT_P50 AGENT_SIM_LAT_P95 AGENT_SIM_LAT_P99 AGENT_SIM_LAT_STDDEV AGENT_SIM_START_RATE AGENT_SIM_END_RATE AGENT_SIM_THROUGHPUT_DRIFT_PERCENT AGENT_SIM_DISK_WRITE_FAILURES AGENT_SIM_DISK_CHECKSUM_FAILURES <<< "$parsed"
+    IFS=$'\t' read -r AGENT_SIM_ITERATIONS_TOTAL AGENT_SIM_ITERATIONS_SUCCESSFUL AGENT_SIM_ITERATIONS_FAILED AGENT_SIM_FAILURE_RATE AGENT_SIM_LAT_P50 AGENT_SIM_LAT_P95 AGENT_SIM_LAT_P99 AGENT_SIM_LAT_STDDEV AGENT_SIM_START_RATE AGENT_SIM_END_RATE AGENT_SIM_THROUGHPUT_DRIFT_PERCENT AGENT_SIM_DISK_WRITE_FAILURES AGENT_SIM_DISK_CHECKSUM_FAILURES AGENT_SIM_LAT_START_AVG AGENT_SIM_LAT_END_AVG AGENT_SIM_LAT_START_P95 AGENT_SIM_LAT_END_P95 AGENT_SIM_FAILURE_COUNT AGENT_SIM_DRIFT_PERCENT <<< "$parsed"
   fi
 }
 
@@ -1431,6 +1488,13 @@ import json, os, sys
   agent_throughput_drift_percent,
   agent_disk_write_failures,
   agent_disk_checksum_failures,
+  agent_sim_window_percent,
+  agent_lat_start_avg,
+  agent_lat_end_avg,
+  agent_lat_start_p95,
+  agent_lat_end_p95,
+  agent_failure_count,
+  agent_drift_percent,
 ) = sys.argv[1:]
 
 def num(v):
@@ -1659,6 +1723,21 @@ obj = {
             "checksum_failures": integer(agent_disk_checksum_failures),
         },
     },
+    "instrumentation": {
+        "agent_sim_v1": {
+            "window_definition": {
+                "successful_task_window_percent": integer(agent_sim_window_percent),
+            },
+            "metrics": {
+                "latency_start_avg_ms": num(agent_lat_start_avg),
+                "latency_end_avg_ms": num(agent_lat_end_avg),
+                "latency_start_p95_ms": num(agent_lat_start_p95),
+                "latency_end_p95_ms": num(agent_lat_end_p95),
+                "failure_count": integer(agent_failure_count),
+                "drift_percent": num(agent_drift_percent),
+            },
+        },
+    } if (num(agent_lat_start_avg) is not None or num(agent_lat_end_avg) is not None or integer(agent_failure_count) is not None or num(agent_drift_percent) is not None) else {},
     "status_notes": [line for line in status_notes_blob.splitlines() if line.strip()],
     "timestamps": {
         "started_at_utc": started_at,
