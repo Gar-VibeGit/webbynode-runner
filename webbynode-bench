@@ -838,7 +838,6 @@ with open(out_json, "w", encoding="utf-8") as f:
     json.dump(obj, f, indent=2)
     f.write("\n")
 PY
-PY
 
   if [[ -f "$AGENT_SIM_JSON" ]]; then
     local parsed
@@ -1354,7 +1353,14 @@ write_run_json() {
     "$AGENT_SIM_END_RATE" \
     "$AGENT_SIM_THROUGHPUT_DRIFT_PERCENT" \
     "$AGENT_SIM_DISK_WRITE_FAILURES" \
-    "$AGENT_SIM_DISK_CHECKSUM_FAILURES" <<'PY'
+    "$AGENT_SIM_DISK_CHECKSUM_FAILURES" \
+    "$AGENT_SIM_WINDOW_PERCENT" \
+    "$AGENT_SIM_LAT_START_AVG" \
+    "$AGENT_SIM_LAT_END_AVG" \
+    "$AGENT_SIM_LAT_START_P95" \
+    "$AGENT_SIM_LAT_END_P95" \
+    "$AGENT_SIM_FAILURE_COUNT" \
+    "$AGENT_SIM_DRIFT_PERCENT" <<'PY'
 import json, os, sys
 (
   out_path,
