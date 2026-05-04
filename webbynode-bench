@@ -5,10 +5,11 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.2-agent-layer-v1
+# Version: v2.2-agent-layer-v2-integrity
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
+RUNNER_VERSION="v2.2-agent-layer-v2-integrity"
 SCHEMA_VERSION="1.3"
 METHODOLOGY_VERSION="2.1"
 EPOCH="${MEASUREMENT_EPOCH:-v2}"
@@ -36,6 +37,12 @@ SYSBENCH_CPU_MAX_PRIME="20000"
 US_ENDPOINT="us-east.webbynode.com"
 EU_ENDPOINT="eu-west.webbynode.com"
 ASIA_ENDPOINT="asia.webbynode.com"
+US_ENDPOINT_PROVIDER="${US_ENDPOINT_PROVIDER:-Vultr}"
+US_ENDPOINT_REGION="${US_ENDPOINT_REGION:-New Jersey}"
+EU_ENDPOINT_PROVIDER="${EU_ENDPOINT_PROVIDER:-Hetzner}"
+EU_ENDPOINT_REGION="${EU_ENDPOINT_REGION:-Nuremberg}"
+ASIA_ENDPOINT_PROVIDER="${ASIA_ENDPOINT_PROVIDER:-unknown}"
+ASIA_ENDPOINT_REGION="${ASIA_ENDPOINT_REGION:-unknown}"
 
 RUNNER_ARGS=()
 PROVIDER=""
@@ -397,6 +404,7 @@ cleanup_on_error() {
   if [[ -n "${RUN_DIR:-}" ]]; then
     write_run_md || true
     write_run_json || true
+    write_integrity_manifest || true
   fi
   exit "$exit_code"
 }
@@ -1223,7 +1231,27 @@ write_run_json() {
   update_global_status
   FINISHED_AT_UTC="${FINISHED_AT_UTC:-$(timestamp_utc)}"
 
+  local runner_command
+  local quoted_arg
+  runner_command="./${SCRIPT_NAME}"
+  for quoted_arg in "${RUNNER_ARGS[@]}"; do
+    printf -v quoted_arg ' %q' "$quoted_arg"
+    runner_command+="$quoted_arg"
+  done
+
   python3 - "$RUN_JSON" \
+    "$SCRIPT_NAME" \
+    "$RUNNER_VERSION" \
+    "$runner_command" \
+    "$US_ENDPOINT" \
+    "$US_ENDPOINT_PROVIDER" \
+    "$US_ENDPOINT_REGION" \
+    "$EU_ENDPOINT" \
+    "$EU_ENDPOINT_PROVIDER" \
+    "$EU_ENDPOINT_REGION" \
+    "$ASIA_ENDPOINT" \
+    "$ASIA_ENDPOINT_PROVIDER" \
+    "$ASIA_ENDPOINT_REGION" \
     "$SCHEMA_VERSION" \
     "$EPOCH" \
     "$METHODOLOGY_VERSION" \
@@ -1361,9 +1389,21 @@ write_run_json() {
     "$AGENT_SIM_LAT_END_P95" \
     "$AGENT_SIM_FAILURE_COUNT" \
     "$AGENT_SIM_DRIFT_PERCENT" <<'PY'
-import json, os, sys
+import hashlib, json, os, socket, sys
 (
   out_path,
+  script_name,
+  runner_version,
+  runner_command,
+  us_endpoint_host,
+  us_endpoint_provider,
+  us_endpoint_region,
+  eu_endpoint_host,
+  eu_endpoint_provider,
+  eu_endpoint_region,
+  asia_endpoint_host,
+  asia_endpoint_provider,
+  asia_endpoint_region,
   schema_version,
   epoch,
   methodology_version,
@@ -1522,6 +1562,31 @@ def read_text(path):
     except FileNotFoundError:
         return ""
 
+def sha256_file(path):
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def resolved_ips(host):
+    try:
+        return sorted({info[4][0] for info in socket.getaddrinfo(host, None)})
+    except Exception:
+        return []
+
+def endpoint_identity(slug, host, provider, region, outbound_remote, inbound_remote):
+    return {
+        "slug": slug,
+        "host": host,
+        "provider": provider or None,
+        "region": region or None,
+        "resolved_ips": resolved_ips(host),
+        "observed_remote_hosts": sorted({h for h in [outbound_remote, inbound_remote] if h}),
+    }
+
 def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps):
     result = {
         "status": status if status else "missing",
@@ -1563,8 +1628,20 @@ obj = {
         "virtualization": virt_type,
         "hostname": hostname_fqdn,
     },
+    "runner": {
+        "name": script_name,
+        "version": runner_version,
+        "command": runner_command,
+        "schema_version": schema_version,
+        "methodology_version": methodology_version,
+    },
+    "measurement_endpoints": {
+        "us_east": endpoint_identity("us-east", us_endpoint_host, us_endpoint_provider, us_endpoint_region, us_out_remote_host, us_in_remote_host),
+        "eu_west": endpoint_identity("eu-west", eu_endpoint_host, eu_endpoint_provider, eu_endpoint_region, eu_out_remote_host, eu_in_remote_host),
+        "asia": endpoint_identity("asia", asia_endpoint_host, asia_endpoint_provider, asia_endpoint_region, asia_out_remote_host, asia_in_remote_host),
+    },
     "commands": {
-        "runner": "./webbynode-bench",
+        "runner": runner_command,
         "cpu": read_text(os.path.join(run_dir, "cmd.sysbench.txt")),
         "storage": read_text(os.path.join(run_dir, "cmd.fio.txt")),
         "network": {
@@ -1674,17 +1751,17 @@ obj = {
         },
         "network": {
             "us_east": {
-                "endpoint": {"slug": "us-east", "host": "us-east.webbynode.com"},
+                "endpoint": {"slug": "us-east", "host": us_endpoint_host},
                 "outbound": network_entry("us-east", us_out_remote_host, "outbound", net_us_out_status, net_us_out_retries_used, us_out_sent_bps, us_out_received_bps),
                 "inbound": network_entry("us-east", us_in_remote_host, "inbound", net_us_in_status, net_us_in_retries_used, us_in_sent_bps, us_in_received_bps),
             },
             "eu_west": {
-                "endpoint": {"slug": "eu-west", "host": "eu-west.webbynode.com"},
+                "endpoint": {"slug": "eu-west", "host": eu_endpoint_host},
                 "outbound": network_entry("eu-west", eu_out_remote_host, "outbound", net_eu_out_status, net_eu_out_retries_used, eu_out_sent_bps, eu_out_received_bps),
                 "inbound": network_entry("eu-west", eu_in_remote_host, "inbound", net_eu_in_status, net_eu_in_retries_used, eu_in_sent_bps, eu_in_received_bps),
             },
             "asia": {
-                "endpoint": {"slug": "asia", "host": "asia.webbynode.com"},
+                "endpoint": {"slug": "asia", "host": asia_endpoint_host},
                 "outbound": network_entry("asia", asia_out_remote_host, "outbound", net_asia_out_status, net_asia_out_retries_used, asia_out_sent_bps, asia_out_received_bps),
                 "inbound": network_entry("asia", asia_in_remote_host, "inbound", net_asia_in_status, net_asia_in_retries_used, asia_in_sent_bps, asia_in_received_bps),
             },
@@ -1704,6 +1781,7 @@ obj = {
         "telemetry_log": os.path.basename(telemetry_log) if telemetry_log else None,
         "agent_sim_json": os.path.basename(agent_sim_json) if os.path.exists(agent_sim_json) else None,
         "raw_agent_sim_log": os.path.basename(raw_agent_sim_log) if os.path.exists(raw_agent_sim_log) else None,
+        "artifact_manifest_sha256": "artifact-manifest.sha256",
     },
     "agent_sim": {
         "enabled": agent_sim_json not in ("", "None", "null") and os.path.exists(agent_sim_json),
@@ -1744,6 +1822,25 @@ obj = {
             },
         },
     } if (num(agent_lat_start_avg) is not None or num(agent_lat_end_avg) is not None or integer(agent_failure_count) is not None or num(agent_drift_percent) is not None) else {},
+    "artifact_hashes": {
+        "run_md_sha256": sha256_file(run_md),
+        "raw_sysbench_log_sha256": sha256_file(raw_sysbench_log),
+        "raw_fio_log_sha256": sha256_file(raw_fio_log),
+        "raw_iperf_us_out_log_sha256": sha256_file(raw_iperf_us_out_log),
+        "raw_iperf_us_in_log_sha256": sha256_file(raw_iperf_us_in_log),
+        "raw_iperf_eu_out_log_sha256": sha256_file(raw_iperf_eu_out_log),
+        "raw_iperf_eu_in_log_sha256": sha256_file(raw_iperf_eu_in_log),
+        "raw_iperf_asia_out_log_sha256": sha256_file(raw_iperf_asia_out_log),
+        "raw_iperf_asia_in_log_sha256": sha256_file(raw_iperf_asia_in_log),
+        "telemetry_log_sha256": sha256_file(telemetry_log),
+        "agent_sim_json_sha256": sha256_file(agent_sim_json),
+        "raw_agent_sim_log_sha256": sha256_file(raw_agent_sim_log),
+    },
+    "integrity": {
+        "hash_algorithm": "sha256",
+        "run_json_self_hash_note": "Final run.json and run.log hashes are written to artifact-manifest.sha256 after validation/logging completes.",
+        "append_only_required": True,
+    },
     "status_notes": [line for line in status_notes_blob.splitlines() if line.strip()],
     "timestamps": {
         "started_at_utc": started_at,
@@ -1759,6 +1856,22 @@ os.replace(tmp_path, out_path)
 PY
 }
 
+
+write_integrity_manifest() {
+  [[ -n "${RUN_DIR:-}" ]] || return 0
+  local manifest="${RUN_DIR}/artifact-manifest.sha256"
+  local tmp="${manifest}.tmp"
+  (
+    cd "$RUN_DIR"
+    for name in       run.json       run.log       run.md       raw.sysbench.log       raw.fio.log       raw.iperf-us-east-outbound.log       raw.iperf-us-east-inbound.log       raw.iperf-eu-west-outbound.log       raw.iperf-eu-west-inbound.log       raw.iperf-asia-outbound.log       raw.iperf-asia-inbound.log       telemetry.log       agent-sim.json       raw.agent-sim.log; do
+      if [[ -f "$name" ]]; then
+        sha256sum "$name"
+      fi
+    done
+  ) > "$tmp"
+  mv "$tmp" "$manifest"
+}
+
 validate_run_json() {
   log "Validating run.json"
   python3 - "$RUN_JSON" "$RUN_DIR" "$RUN_ID" <<'PY'
@@ -1768,7 +1881,8 @@ with open(run_json, 'r', encoding='utf-8') as f:
     data = json.load(f)
 required_top = [
     'schema_version', 'epoch', 'methodology_version', 'run_id', 'status',
-    'provider', 'region', 'plan', 'pricing', 'environment', 'commands', 'results', 'artifacts', 'timestamps'
+    'provider', 'region', 'plan', 'pricing', 'environment', 'runner', 'measurement_endpoints',
+    'commands', 'results', 'artifacts', 'artifact_hashes', 'integrity', 'timestamps'
 ]
 missing = [k for k in required_top if k not in data]
 if missing:
@@ -1777,6 +1891,22 @@ if data['run_id'] != expected_run_id:
     raise SystemExit('run_id mismatch')
 if not re.match(r'^[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+-\d{4}-\d{2}-\d{2}-\d{3}$', data['run_id']):
     raise SystemExit('run_id format invalid')
+for ts_key in ['started_at_utc', 'finished_at_utc']:
+    value = data.get('timestamps', {}).get(ts_key)
+    if not isinstance(value, str) or not re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$', value):
+        raise SystemExit(f'{ts_key} must be strict UTC ISO8601 ending in Z')
+for endpoint in ['us_east', 'eu_west', 'asia']:
+    ident = data.get('measurement_endpoints', {}).get(endpoint)
+    if not isinstance(ident, dict) or not ident.get('host'):
+        raise SystemExit(f'Missing measurement endpoint identity: {endpoint}')
+for hash_key in [
+    'raw_sysbench_log_sha256', 'raw_fio_log_sha256',
+    'raw_iperf_us_out_log_sha256', 'raw_iperf_us_in_log_sha256',
+    'raw_iperf_eu_out_log_sha256', 'raw_iperf_eu_in_log_sha256',
+    'raw_iperf_asia_out_log_sha256', 'raw_iperf_asia_in_log_sha256',
+]:
+    if not data.get('artifact_hashes', {}).get(hash_key):
+        raise SystemExit(f'Missing required artifact hash: {hash_key}')
 for name in [
     'run.log', 'raw.sysbench.log', 'raw.fio.log',
     'raw.iperf-us-east-outbound.log', 'raw.iperf-us-east-inbound.log',
@@ -1810,6 +1940,7 @@ main() {
   log "Completed"
   log "Global status: ${GLOBAL_STATUS}"
   log "Artifacts written to ${RUN_DIR}"
+  write_integrity_manifest
 }
 
 main "$@"
