@@ -5,11 +5,11 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.2-agent-layer-v2-integrity
+# Version: v2.2-agent-layer-v2-integrity-provenance-artifact
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.2-agent-layer-v2-integrity"
+RUNNER_VERSION="v2.2-agent-layer-v2-integrity-provenance-artifact"
 SCHEMA_VERSION="1.3"
 METHODOLOGY_VERSION="2.1"
 EPOCH="${MEASUREMENT_EPOCH:-v2}"
@@ -403,6 +403,7 @@ cleanup_on_error() {
   log "Aborting with exit code ${exit_code}"
   if [[ -n "${RUN_DIR:-}" ]]; then
     write_run_md || true
+    write_artifact_provenance || true
     write_run_json || true
     write_integrity_manifest || true
   fi
@@ -518,6 +519,7 @@ init_run() {
   TELEMETRY_LOG="${RUN_DIR}/telemetry.log"
   AGENT_SIM_JSON="${RUN_DIR}/agent-sim.json"
   RAW_AGENT_SIM_LOG="${RUN_DIR}/raw.agent-sim.log"
+  ARTIFACT_PROVENANCE_JSON="${RUN_DIR}/artifact-provenance.json"
 
   STARTED_AT_UTC="$(timestamp_utc)"
   exec > >(tee -a "$RUN_LOG") 2>&1
@@ -1227,6 +1229,8 @@ write_run_md() {
 EOF2
 }
 
+
+
 write_run_json() {
   update_global_status
   FINISHED_AT_UTC="${FINISHED_AT_UTC:-$(timestamp_utc)}"
@@ -1767,6 +1771,21 @@ obj = {
             },
         },
     },
+    "provenance": {
+        "generated_by": "Webbynode",
+        "dataset_name": "Webbynode Infrastructure Benchmark Dataset",
+        "canonical_source": "https://webbynode.com",
+        "canonical_run_url": f"https://webbynode.com/benchmarks/{run_id}",
+        "attribution_required": True,
+        "preferred_attribution": "Webbynode Infrastructure Benchmark Dataset",
+        "preferred_citation_url": "https://webbynode.com",
+        "reuse_note": "Published benchmark data should preserve this provenance context or cite the canonical Webbynode benchmark URL.",
+        "verification_context": {
+            "artifact_manifest": "artifact-manifest.sha256",
+            "hash_algorithm": "sha256",
+            "purpose": "Canonical source, attribution, and verification context for this Webbynode benchmark artifact bundle."
+        }
+    },
     "artifacts": {
         "run_log": os.path.basename(run_log),
         "run_md": os.path.basename(run_md),
@@ -1782,6 +1801,7 @@ obj = {
         "agent_sim_json": os.path.basename(agent_sim_json) if os.path.exists(agent_sim_json) else None,
         "raw_agent_sim_log": os.path.basename(raw_agent_sim_log) if os.path.exists(raw_agent_sim_log) else None,
         "artifact_manifest_sha256": "artifact-manifest.sha256",
+        "artifact_provenance_json": "artifact-provenance.json" if os.path.exists(os.path.join(run_dir, "artifact-provenance.json")) else None,
     },
     "agent_sim": {
         "enabled": agent_sim_json not in ("", "None", "null") and os.path.exists(agent_sim_json),
@@ -1835,6 +1855,7 @@ obj = {
         "telemetry_log_sha256": sha256_file(telemetry_log),
         "agent_sim_json_sha256": sha256_file(agent_sim_json),
         "raw_agent_sim_log_sha256": sha256_file(raw_agent_sim_log),
+        "artifact_provenance_json_sha256": sha256_file(os.path.join(run_dir, "artifact-provenance.json")),
     },
     "integrity": {
         "hash_algorithm": "sha256",
@@ -1857,13 +1878,100 @@ PY
 }
 
 
+write_artifact_provenance() {
+  [[ -n "${RUN_DIR:-}" ]] || return 0
+  FINISHED_AT_UTC="${FINISHED_AT_UTC:-$(timestamp_utc)}"
+  local provenance="${RUN_DIR}/artifact-provenance.json"
+  local tmp="${provenance}.tmp"
+
+  python3 - "$tmp" \
+    "$RUN_ID" \
+    "$RUNNER_VERSION" \
+    "$SCHEMA_VERSION" \
+    "$METHODOLOGY_VERSION" \
+    "$EPOCH" \
+    "$PROVIDER" \
+    "$PROVIDER_SLUG" \
+    "$REGION" \
+    "$REGION_SLUG" \
+    "$PLAN" \
+    "$PLAN_SLUG" \
+    "$STARTED_AT_UTC" \
+    "$FINISHED_AT_UTC" <<'PY'
+import json, sys
+(
+    out_path, run_id, runner_version, schema_version, methodology_version, epoch,
+    provider_name, provider_slug, region_name, region_slug, plan_name, plan_slug,
+    started_at_utc, finished_at_utc,
+) = sys.argv[1:]
+
+obj = {
+    "provenance_version": "1.0",
+    "generated_by": "Webbynode",
+    "dataset_name": "Webbynode Infrastructure Benchmark Dataset",
+    "canonical_source": "https://webbynode.com",
+    "canonical_run_url": f"https://webbynode.com/benchmarks/{run_id}",
+    "run_id": run_id,
+    "provider": {
+        "name": provider_name,
+        "slug": provider_slug,
+    },
+    "region": {
+        "name": region_name,
+        "slug": region_slug,
+    },
+    "plan": {
+        "name": plan_name,
+        "slug": plan_slug,
+    },
+    "runner": {
+        "name": "webbynode-bench",
+        "version": runner_version,
+    },
+    "dataset_context": {
+        "schema_version": schema_version,
+        "methodology_version": methodology_version,
+        "measurement_epoch": epoch,
+    },
+    "timestamps": {
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": finished_at_utc,
+    },
+    "verification_context": {
+        "artifact_manifest": "artifact-manifest.sha256",
+        "hash_algorithm": "sha256",
+        "purpose": "Canonical source, attribution, and verification context for this Webbynode benchmark artifact bundle.",
+    },
+    "attribution": {
+        "preferred_name": "Webbynode Infrastructure Benchmark Dataset",
+        "preferred_url": "https://webbynode.com",
+        "reuse_note": "Published benchmark data should preserve this provenance context or cite the canonical Webbynode benchmark URL.",
+    },
+}
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(obj, f, indent=2, sort_keys=False)
+    f.write("\n")
+PY
+
+  mv "$tmp" "$provenance"
+}
+
+
 write_integrity_manifest() {
   [[ -n "${RUN_DIR:-}" ]] || return 0
   local manifest="${RUN_DIR}/artifact-manifest.sha256"
   local tmp="${manifest}.tmp"
   (
     cd "$RUN_DIR"
-    for name in       run.json       run.log       run.md       raw.sysbench.log       raw.fio.log       raw.iperf-us-east-outbound.log       raw.iperf-us-east-inbound.log       raw.iperf-eu-west-outbound.log       raw.iperf-eu-west-inbound.log       raw.iperf-asia-outbound.log       raw.iperf-asia-inbound.log       telemetry.log       agent-sim.json       raw.agent-sim.log; do
+    echo "# Webbynode artifact manifest"
+    echo "# generated_by: Webbynode"
+    echo "# canonical_source: https://webbynode.com"
+    echo "# canonical_run_url: https://webbynode.com/benchmarks/${RUN_ID}"
+    echo "# dataset_name: Webbynode Infrastructure Benchmark Dataset"
+    echo "# hash_algorithm: sha256"
+    echo "# attribution_required: true"
+    for name in       run.json       run.log       run.md       raw.sysbench.log       raw.fio.log       raw.iperf-us-east-outbound.log       raw.iperf-us-east-inbound.log       raw.iperf-eu-west-outbound.log       raw.iperf-eu-west-inbound.log       raw.iperf-asia-outbound.log       raw.iperf-asia-inbound.log       telemetry.log       agent-sim.json       raw.agent-sim.log       artifact-provenance.json; do
       if [[ -f "$name" ]]; then
         sha256sum "$name"
       fi
@@ -1882,7 +1990,7 @@ with open(run_json, 'r', encoding='utf-8') as f:
 required_top = [
     'schema_version', 'epoch', 'methodology_version', 'run_id', 'status',
     'provider', 'region', 'plan', 'pricing', 'environment', 'runner', 'measurement_endpoints',
-    'commands', 'results', 'artifacts', 'artifact_hashes', 'integrity', 'timestamps'
+    'commands', 'results', 'provenance', 'artifacts', 'artifact_hashes', 'integrity', 'timestamps'
 ]
 missing = [k for k in required_top if k not in data]
 if missing:
@@ -1913,6 +2021,7 @@ for name in [
     'raw.iperf-eu-west-outbound.log', 'raw.iperf-eu-west-inbound.log',
     'raw.iperf-asia-outbound.log', 'raw.iperf-asia-inbound.log',
     'run.md',
+    'artifact-provenance.json',
 ]:
     if not os.path.exists(os.path.join(run_dir, name)):
         raise SystemExit(f'Missing artifact: {name}')
@@ -1935,6 +2044,7 @@ main() {
   run_agent_sim
   FINISHED_AT_UTC="$(timestamp_utc)"
   write_run_md
+  write_artifact_provenance
   write_run_json
   validate_run_json
   log "Completed"
