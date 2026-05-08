@@ -5,11 +5,11 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.3.1-jsonl-buffered
+# Version: v2.4-agent-sim-v2
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.3.1-jsonl-buffered"
+RUNNER_VERSION="v2.4-agent-sim-v2"
 SCHEMA_VERSION="1.3"
 METHODOLOGY_VERSION="2.1"
 EPOCH="${MEASUREMENT_EPOCH:-v2}"
@@ -404,6 +404,7 @@ cleanup_on_error() {
   append_status_note "runner_exit_code=${exit_code}"
   log "Aborting with exit code ${exit_code}"
   if [[ -n "${RUN_DIR:-}" ]]; then
+    update_global_status || true
     write_run_md || true
     write_artifact_provenance || true
     write_run_json || true
@@ -699,7 +700,7 @@ run_agent_sim() {
     return 0
   fi
 
-  log "Running agent simulation v1 with regret-prevention telemetry"
+  log "Running agent simulation v2 with operational telemetry"
   python3 - "$AGENT_SIM_JSON" "$RAW_AGENT_SIM_LOG" "$AGENT_SIM_DURATION" "$US_ENDPOINT" "$RUN_DIR/agent.db" "$RUN_DIR/agent.log" "$AGENT_SIM_WINDOW_PERCENT" "$RAW_SYSTEM_TELEMETRY_LOG" "$SYSTEM_TELEMETRY_JSON" <<'AGENTPY'
 import collections, datetime, hashlib, json, math, os, sqlite3, statistics, sys, time, urllib.error, urllib.request
 out_json, out_log, duration_s, endpoint, db_path, log_path, window_pct, system_log_path, system_json_path = sys.argv[1:]
@@ -959,7 +960,7 @@ with open(system_json_path, 'w', encoding='utf-8') as f:
     f.write('\n')
 
 obj = {
-    'version': 'agent_sim_v1',
+    'version': 'agent_sim_v2',
     'duration_seconds': duration_s,
     'iterations_total': iterations,
     'iterations_successful': successful,
@@ -982,7 +983,7 @@ obj = {
     'phase_windows': {'warmup_percent': window_pct, 'final_window_percent': window_pct, 'steady_state_percent': max(0, 100 - (2 * window_pct))},
     'raw_artifacts': {'raw_agent_sim_log': os.path.basename(out_log), 'raw_system_telemetry_log': os.path.basename(system_log_path), 'system_telemetry_json': os.path.basename(system_json_path)},
     'instrumentation': {
-        'agent_sim_v1': {
+        'agent_sim_v2': {
             'window_definition': {'successful_task_window_percent': window_pct, 'successful_task_window_count': window_count},
             'metrics': {
                 'latency_avg_ms': mean(latencies),
@@ -1003,6 +1004,10 @@ obj = {
         'system_telemetry_v1': {'metrics': system_obj},
     },
 }
+# Backward-compatible alias for current exporter/site readers that still look for agent_sim_v1.
+# Primary semantics for new runs are agent_sim_v2.
+obj['instrumentation']['agent_sim_v1'] = obj['instrumentation']['agent_sim_v2']
+
 with open(out_json, 'w', encoding='utf-8') as f:
     json.dump(obj, f, indent=2)
     f.write('\n')
@@ -1019,12 +1024,12 @@ vals = [
     j.get('latency_ms', {}).get('p50'), j.get('latency_ms', {}).get('p95'), j.get('latency_ms', {}).get('p99'), j.get('latency_ms', {}).get('stddev'),
     j.get('iterations_per_second', {}).get('start_window'), j.get('iterations_per_second', {}).get('end_window'), j.get('throughput_drift_percent'),
     j.get('disk', {}).get('write_failures'), j.get('disk', {}).get('checksum_failures'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('latency_start_avg_ms'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('latency_end_avg_ms'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('latency_start_p95_ms'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('latency_end_p95_ms'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('failure_count'),
-    j.get('instrumentation', {}).get('agent_sim_v1', {}).get('metrics', {}).get('drift_percent'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('latency_start_avg_ms'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('latency_end_avg_ms'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('latency_start_p95_ms'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('latency_end_p95_ms'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('failure_count'),
+    (j.get('instrumentation', {}).get('agent_sim_v2') or j.get('instrumentation', {}).get('agent_sim_v1') or {}).get('metrics', {}).get('drift_percent'),
 ]
 print('\t'.join('' if v is None else str(v) for v in vals))
 PARSEPY
@@ -1770,8 +1775,9 @@ system_telemetry_json = os.path.join(run_dir, "system-telemetry.json")
 raw_system_telemetry_log = os.path.join(run_dir, "raw.system-telemetry.log")
 agent_sim_summary = load_json_optional(agent_sim_json) or {}
 system_telemetry_summary = load_json_optional(system_telemetry_json) or {}
-agent_inst_metrics = (((agent_sim_summary.get("instrumentation") or {}).get("agent_sim_v1") or {}).get("metrics") or {})
-agent_window_def = (((agent_sim_summary.get("instrumentation") or {}).get("agent_sim_v1") or {}).get("window_definition") or {})
+agent_inst_block = ((agent_sim_summary.get("instrumentation") or {}).get("agent_sim_v2") or (agent_sim_summary.get("instrumentation") or {}).get("agent_sim_v1") or {})
+agent_inst_metrics = (agent_inst_block.get("metrics") or {})
+agent_window_def = (agent_inst_block.get("window_definition") or {})
 
 obj = {
     "schema_version": schema_version,
@@ -1973,7 +1979,7 @@ obj = {
     },
     "agent_sim": {
         "enabled": agent_sim_json not in ("", "None", "null") and os.path.exists(agent_sim_json),
-        "version": "agent_sim_v1" if agent_iterations_total else None,
+        "version": "agent_sim_v2" if agent_iterations_total else None,
         "duration_seconds": integer(agent_sim_duration),
         "iterations_total": integer(agent_iterations_total),
         "iterations_successful": integer(agent_iterations_successful),
@@ -2001,7 +2007,7 @@ obj = {
         },
     },
     "instrumentation": {
-        "agent_sim_v1": {
+        "agent_sim_v2": {
             "window_definition": {
                 "successful_task_window_percent": integer(agent_sim_window_percent),
                 "successful_task_window_count": integer(agent_window_def.get("successful_task_window_count")),
@@ -2059,6 +2065,11 @@ obj = {
         "finished_at_utc": finished_at,
     },
 }
+
+# Backward-compatible alias for current exporter/site readers that still look for instrumentation.agent_sim_v1.
+# New runs should treat instrumentation.agent_sim_v2 as primary.
+if isinstance(obj.get("instrumentation"), dict) and "agent_sim_v2" in obj["instrumentation"]:
+    obj["instrumentation"]["agent_sim_v1"] = obj["instrumentation"]["agent_sim_v2"]
 
 tmp_path = out_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2234,6 +2245,7 @@ main() {
   run_network
   run_agent_sim
   FINISHED_AT_UTC="$(timestamp_utc)"
+  update_global_status
   write_run_md
   write_artifact_provenance
   write_run_json
