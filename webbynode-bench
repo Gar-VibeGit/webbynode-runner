@@ -5,21 +5,28 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.4-agent-sim-v2
+# Version: v2.5-network-budget-v3
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.4-agent-sim-v2"
-SCHEMA_VERSION="1.3"
-METHODOLOGY_VERSION="2.1"
-EPOCH="${MEASUREMENT_EPOCH:-v2}"
-MEASUREMENT_EPOCH="${MEASUREMENT_EPOCH:-v2}"
+RUNNER_VERSION="v2.5-network-budget-v3"
+SCHEMA_VERSION="1.4"
+METHODOLOGY_VERSION="3.0"
+EPOCH="v3"
+MEASUREMENT_EPOCH="v3"
 
 BASE_DIR="/benchmarks"
 IPERF_PORT="5201"
-IPERF_DURATION="${IPERF_DURATION:-15}"
-IPERF_PARALLEL="${IPERF_PARALLEL:-1}"
-IPERF_RETRIES_MAX="${IPERF_RETRIES_MAX:-3}"
+NETWORK_PROTOCOL_VERSION="3.0"
+NETWORK_CLUSTER_LIMIT_BYTES="1000000000"
+NETWORK_RUN_LIMIT_BYTES="333333333"
+NETWORK_GUARD_STOP_BYTES="320000000"
+NETWORK_PLANNED_PAYLOAD_BYTES="270000000"
+NETWORK_ENDPOINT_PAYLOAD_BYTES="90000000"
+IPERF_TARGET_BPS="90000000"
+IPERF_DURATION="8"
+IPERF_PARALLEL="1"
+IPERF_RETRIES_MAX="1"
 IPERF_RETRY_SLEEP="${IPERF_RETRY_SLEEP:-30}"
 
 FIO_RUNTIME="30"
@@ -200,6 +207,13 @@ ASIA_IN_REMOTE_HOST=""
 ASIA_IN_SENT_BPS=""
 ASIA_IN_RECEIVED_BPS=""
 
+NETWORK_EGRESS_INTERFACE=""
+NETWORK_EGRESS_BASELINE_BYTES=""
+NETWORK_EGRESS_MEASURED_BYTES=""
+NETWORK_APPLICATION_BYTES_SENT=""
+NETWORK_BUDGET_STATUS="not_run"
+NETWORK_BUDGET_ENFORCEMENT="os-interface-counter-process-guard"
+
 usage() {
   cat <<EOF2
 Usage:
@@ -212,11 +226,11 @@ Required:
   --price            Monthly price in USD
 
 Optional:
-  --measurement-epoch Measurement epoch label (default: ${MEASUREMENT_EPOCH})
+  --measurement-epoch Accepted for launcher compatibility; Network Protocol v3 is enforced
   --agent-sim-enabled 1/0 to enable agent simulation run (default: ${AGENT_SIM_ENABLED})
   --agent-sim-duration Duration in seconds for agent simulation run (default: ${AGENT_SIM_DURATION})
-  --iperf-parallel   iperf3 parallel streams (default: ${IPERF_PARALLEL})
-  --iperf-duration   iperf3 duration seconds (default: ${IPERF_DURATION})
+  --iperf-parallel   Accepted for launcher compatibility; v3 always uses 1 stream
+  --iperf-duration   Accepted for launcher compatibility; v3 always uses 8 seconds
   -h, --help         Show help
 EOF2
 }
@@ -394,6 +408,19 @@ update_global_status() {
         ;;
     esac
   done
+
+  case "$NETWORK_BUDGET_STATUS" in
+    within_budget|not_run)
+      ;;
+    counter_unavailable|guard_stopped|payload_noncompliant|budget_noncompliant)
+      if [[ "$GLOBAL_STATUS" != "error" ]]; then
+        GLOBAL_STATUS="partial"
+      fi
+      ;;
+    *)
+      GLOBAL_STATUS="error"
+      ;;
+  esac
 }
 
 cleanup_on_error() {
@@ -435,16 +462,18 @@ parse_args() {
         shift 2
         ;;
       --iperf-parallel)
-        IPERF_PARALLEL="${2:-}"
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--iperf-parallel must be an integer"
+        [[ "${2:-}" == "1" ]] || log "Ignoring --iperf-parallel=${2:-}; Network Protocol v3 requires 1"
         shift 2
         ;;
       --iperf-duration)
-        IPERF_DURATION="${2:-}"
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--iperf-duration must be an integer"
+        [[ "${2:-}" == "8" ]] || log "Ignoring --iperf-duration=${2:-}; Network Protocol v3 requires 8 seconds"
         shift 2
         ;;
       --measurement-epoch)
-        MEASUREMENT_EPOCH="${2:-}"
-        EPOCH="${MEASUREMENT_EPOCH}"
+        [[ -n "${2:-}" ]] || die "--measurement-epoch requires a value"
+        [[ "${2:-}" == "v3" ]] || log "Ignoring --measurement-epoch=${2:-}; this runner emits Network Protocol v3"
         shift 2
         ;;
       --agent-sim-enabled)
@@ -475,6 +504,49 @@ parse_args() {
   [[ "$AGENT_SIM_ENABLED" =~ ^[01]$ ]] || die "--agent-sim-enabled must be 0 or 1"
   [[ "$AGENT_SIM_DURATION" =~ ^[0-9]+$ ]] || die "--agent-sim-duration must be an integer"
   validate_price || die "--price must be a non-negative number"
+}
+
+detect_egress_interface() {
+  local iface=""
+  if [[ -r /proc/net/route ]]; then
+    iface="$(awk '$2 == "00000000" && $1 != "lo" { print $1; exit }' /proc/net/route)"
+  fi
+  if [[ -z "$iface" && -d /sys/class/net ]]; then
+    local candidate
+    for candidate in /sys/class/net/*; do
+      [[ "${candidate##*/}" == "lo" ]] && continue
+      iface="${candidate##*/}"
+      break
+    done
+  fi
+  printf '%s' "$iface"
+}
+
+read_interface_tx_bytes() {
+  local iface="$1"
+  local counter="/sys/class/net/${iface}/statistics/tx_bytes"
+  [[ -n "$iface" && -r "$counter" ]] || return 1
+  local value
+  value="$(<"$counter")"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$value"
+}
+
+update_network_egress_counter() {
+  local current=""
+  if [[ -z "$NETWORK_EGRESS_INTERFACE" || -z "$NETWORK_EGRESS_BASELINE_BYTES" ]]; then
+    NETWORK_EGRESS_MEASURED_BYTES=""
+    return 1
+  fi
+  current="$(read_interface_tx_bytes "$NETWORK_EGRESS_INTERFACE")" || {
+    NETWORK_EGRESS_MEASURED_BYTES=""
+    return 1
+  }
+  if (( current < NETWORK_EGRESS_BASELINE_BYTES )); then
+    NETWORK_EGRESS_MEASURED_BYTES=""
+    return 1
+  fi
+  NETWORK_EGRESS_MEASURED_BYTES="$((current - NETWORK_EGRESS_BASELINE_BYTES))"
 }
 
 check_dependencies() {
@@ -1224,7 +1296,12 @@ run_iperf_with_retry() {
   local classified=""
 
   while (( attempt <= IPERF_RETRIES_MAX )); do
-    local cmd=(iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION")
+    local cmd=(
+      iperf3 -c "$endpoint_host" -p "$IPERF_PORT"
+      -P "$IPERF_PARALLEL"
+      -b "$IPERF_TARGET_BPS"
+      -t "$IPERF_DURATION"
+    )
     if [[ "$reverse_flag" == "reverse" ]]; then
       cmd+=( -R )
     fi
@@ -1232,12 +1309,24 @@ run_iperf_with_retry() {
     printf '%q ' "${cmd[@]}" | sed 's/ $/\n/' > "${outfile%.log}.cmd.txt"
 
     set +e
-    if [[ "$reverse_flag" == "reverse" ]]; then
-      iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -R -J > "$outfile" 2>&1
-    else
-      iperf3 -c "$endpoint_host" -p "$IPERF_PORT" -P "$IPERF_PARALLEL" -t "$IPERF_DURATION" -J > "$outfile" 2>&1
-    fi
+    "${cmd[@]}" > "$outfile" 2>&1 &
+    local iperf_pid=$!
+    local budget_stopped=0
+    while kill -0 "$iperf_pid" 2>/dev/null; do
+      if update_network_egress_counter && (( NETWORK_EGRESS_MEASURED_BYTES >= NETWORK_GUARD_STOP_BYTES )); then
+        kill -TERM "$iperf_pid" 2>/dev/null || true
+        budget_stopped=1
+        break
+      fi
+      sleep 0.1
+    done
+    wait "$iperf_pid"
     rc=$?
+    if (( budget_stopped == 1 )); then
+      rc=75
+      NETWORK_BUDGET_STATUS="guard_stopped"
+      append_status_note "network_budget=guard_stopped_at_${NETWORK_EGRESS_MEASURED_BYTES}_bytes"
+    fi
     set -e
 
     printf -v "$retries_var" '%s' "$((attempt - 1))"
@@ -1303,6 +1392,13 @@ capture_iperf_metrics() {
 }
 
 run_network() {
+  NETWORK_EGRESS_INTERFACE="$(detect_egress_interface)"
+  NETWORK_EGRESS_BASELINE_BYTES="$(read_interface_tx_bytes "$NETWORK_EGRESS_INTERFACE" 2>/dev/null || true)"
+  if [[ -z "$NETWORK_EGRESS_INTERFACE" || -z "$NETWORK_EGRESS_BASELINE_BYTES" ]]; then
+    NETWORK_BUDGET_STATUS="counter_unavailable"
+    append_status_note "network_budget=counter_unavailable"
+  fi
+
   log "Running US outbound network benchmark"
   run_iperf_with_retry "$US_ENDPOINT" "$RAW_IPERF_US_OUT_LOG" "" NET_US_OUT_STATUS NET_US_OUT_RETRIES_USED "us_outbound" || true
   capture_iperf_metrics "$RAW_IPERF_US_OUT_LOG" US_OUT_REMOTE_HOST US_OUT_SENT_BPS US_OUT_RECEIVED_BPS
@@ -1332,6 +1428,37 @@ run_network() {
   run_iperf_with_retry "$ASIA_ENDPOINT" "$RAW_IPERF_ASIA_IN_LOG" reverse NET_ASIA_IN_STATUS NET_ASIA_IN_RETRIES_USED "asia_inbound" || true
   capture_iperf_metrics "$RAW_IPERF_ASIA_IN_LOG" ASIA_IN_REMOTE_HOST ASIA_IN_SENT_BPS ASIA_IN_RECEIVED_BPS
   capture_iperf_variance_metrics "$RAW_IPERF_ASIA_IN_LOG" NET_ASIA_IN_STDDEV_BPS NET_ASIA_IN_P95_BPS NET_ASIA_IN_P99_BPS NET_ASIA_IN_P99_TO_P50_RATIO
+
+  update_network_egress_counter || true
+  NETWORK_APPLICATION_BYTES_SENT="$(python3 - "$RAW_IPERF_US_OUT_LOG" "$RAW_IPERF_EU_OUT_LOG" "$RAW_IPERF_ASIA_OUT_LOG" <<'PY'
+import json, sys
+total = 0
+for path in sys.argv[1:]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        amount = value.get("end", {}).get("sum_sent", {}).get("bytes")
+        if isinstance(amount, (int, float)) and amount >= 0:
+            total += int(amount)
+    except Exception:
+        pass
+print(total)
+PY
+)"
+
+  if [[ "$NETWORK_BUDGET_STATUS" == "guard_stopped" ]]; then
+    :
+  elif [[ -z "$NETWORK_EGRESS_MEASURED_BYTES" ]]; then
+    NETWORK_BUDGET_STATUS="counter_unavailable"
+  elif (( NETWORK_APPLICATION_BYTES_SENT > NETWORK_PLANNED_PAYLOAD_BYTES )); then
+    NETWORK_BUDGET_STATUS="payload_noncompliant"
+    append_status_note "network_budget=payload_noncompliant"
+  elif (( NETWORK_EGRESS_MEASURED_BYTES > NETWORK_RUN_LIMIT_BYTES )); then
+    NETWORK_BUDGET_STATUS="budget_noncompliant"
+    append_status_note "network_budget=budget_noncompliant"
+  else
+    NETWORK_BUDGET_STATUS="within_budget"
+  fi
 }
 
 write_run_md() {
@@ -1468,6 +1595,16 @@ write_run_json() {
     "$(printf '%s\n' "${STATUS_NOTES[@]:-}")" \
     "$IPERF_PARALLEL" \
     "$IPERF_DURATION" \
+    "$IPERF_TARGET_BPS" \
+    "$NETWORK_PROTOCOL_VERSION" \
+    "$NETWORK_CLUSTER_LIMIT_BYTES" \
+    "$NETWORK_RUN_LIMIT_BYTES" \
+    "$NETWORK_PLANNED_PAYLOAD_BYTES" \
+    "$NETWORK_EGRESS_INTERFACE" \
+    "$NETWORK_EGRESS_MEASURED_BYTES" \
+    "$NETWORK_APPLICATION_BYTES_SENT" \
+    "$NETWORK_BUDGET_ENFORCEMENT" \
+    "$NETWORK_BUDGET_STATUS" \
     "$CPU_EVENTS_PER_SECOND" \
     "$CPU_LAT_AVG" \
     "$CPU_LAT_P95" \
@@ -1620,6 +1757,16 @@ import hashlib, json, os, socket, sys
   status_notes_blob,
   iperf_parallel,
   iperf_duration,
+  iperf_target_bps,
+  network_protocol_version,
+  network_cluster_limit_bytes,
+  network_run_limit_bytes,
+  network_planned_payload_bytes,
+  network_egress_interface,
+  network_egress_measured_bytes,
+  network_application_bytes_sent,
+  network_budget_enforcement,
+  network_budget_status,
   cpu_events_per_second,
   cpu_lat_avg,
   cpu_lat_p95,
@@ -1755,14 +1902,30 @@ def endpoint_identity(slug, host, provider, region, outbound_remote, inbound_rem
         "observed_remote_hosts": sorted({h for h in [outbound_remote, inbound_remote] if h}),
     }
 
-def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps):
+def iperf_transfer(path, direction):
+    value = load_json_optional(path) or {}
+    end = value.get("end") or {}
+    summary = end.get("sum_sent") or {}
+    sent_bytes = integer(summary.get("bytes"))
+    seconds = num(summary.get("seconds"))
+    achieved = num(summary.get("bits_per_second"))
+    offered = integer(iperf_target_bps)
+    return {
+        "application_bytes_sent": sent_bytes if direction == "outbound" else None,
+        "measured_seconds": seconds,
+        "achieved_bps": achieved,
+        "offered_load_bps": offered,
+        "attainment_ratio": (achieved / offered) if achieved is not None and offered else None,
+    }
+
+def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps, raw_path):
     result = {
         "status": status if status else "missing",
         "remote_host": host or None,
         "sent_bps": num(sent_bps),
         "received_bps": num(recv_bps),
     }
-    return {
+    entry = {
         "direction": direction,
         "parallel_streams": integer(iperf_parallel),
         "duration_seconds": integer(iperf_duration),
@@ -1770,6 +1933,8 @@ def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps):
         "final_outcome": status,
         "result": result,
     }
+    entry.update(iperf_transfer(raw_path, direction))
+    return entry
 
 system_telemetry_json = os.path.join(run_dir, "system-telemetry.json")
 raw_system_telemetry_log = os.path.join(run_dir, "raw.system-telemetry.log")
@@ -1926,20 +2091,34 @@ obj = {
             },
         },
         "network": {
+            "traffic_budget": {
+                "protocol_version": network_protocol_version,
+                "scope": "three-run-cluster",
+                "cluster_limit_bytes": integer(network_cluster_limit_bytes),
+                "run_limit_bytes": integer(network_run_limit_bytes),
+                "planned_payload_bytes": integer(network_planned_payload_bytes),
+                "measured_provider_egress_bytes": integer(network_egress_measured_bytes),
+                "application_bytes_sent": integer(network_application_bytes_sent),
+                "offered_load_bps": integer(iperf_target_bps),
+                "measurement_seconds": integer(iperf_duration),
+                "egress_interface": network_egress_interface or None,
+                "enforcement": network_budget_enforcement,
+                "status": network_budget_status,
+            },
             "us_east": {
                 "endpoint": {"slug": "us-east", "host": us_endpoint_host},
-                "outbound": network_entry("us-east", us_out_remote_host, "outbound", net_us_out_status, net_us_out_retries_used, us_out_sent_bps, us_out_received_bps),
-                "inbound": network_entry("us-east", us_in_remote_host, "inbound", net_us_in_status, net_us_in_retries_used, us_in_sent_bps, us_in_received_bps),
+                "outbound": network_entry("us-east", us_out_remote_host, "outbound", net_us_out_status, net_us_out_retries_used, us_out_sent_bps, us_out_received_bps, raw_iperf_us_out_log),
+                "inbound": network_entry("us-east", us_in_remote_host, "inbound", net_us_in_status, net_us_in_retries_used, us_in_sent_bps, us_in_received_bps, raw_iperf_us_in_log),
             },
             "eu_west": {
                 "endpoint": {"slug": "eu-west", "host": eu_endpoint_host},
-                "outbound": network_entry("eu-west", eu_out_remote_host, "outbound", net_eu_out_status, net_eu_out_retries_used, eu_out_sent_bps, eu_out_received_bps),
-                "inbound": network_entry("eu-west", eu_in_remote_host, "inbound", net_eu_in_status, net_eu_in_retries_used, eu_in_sent_bps, eu_in_received_bps),
+                "outbound": network_entry("eu-west", eu_out_remote_host, "outbound", net_eu_out_status, net_eu_out_retries_used, eu_out_sent_bps, eu_out_received_bps, raw_iperf_eu_out_log),
+                "inbound": network_entry("eu-west", eu_in_remote_host, "inbound", net_eu_in_status, net_eu_in_retries_used, eu_in_sent_bps, eu_in_received_bps, raw_iperf_eu_in_log),
             },
             "asia": {
                 "endpoint": {"slug": "asia", "host": asia_endpoint_host},
-                "outbound": network_entry("asia", asia_out_remote_host, "outbound", net_asia_out_status, net_asia_out_retries_used, asia_out_sent_bps, asia_out_received_bps),
-                "inbound": network_entry("asia", asia_in_remote_host, "inbound", net_asia_in_status, net_asia_in_retries_used, asia_in_sent_bps, asia_in_received_bps),
+                "outbound": network_entry("asia", asia_out_remote_host, "outbound", net_asia_out_status, net_asia_out_retries_used, asia_out_sent_bps, asia_out_received_bps, raw_iperf_asia_out_log),
+                "inbound": network_entry("asia", asia_in_remote_host, "inbound", net_asia_in_status, net_asia_in_retries_used, asia_in_sent_bps, asia_in_received_bps, raw_iperf_asia_in_log),
             },
         },
     },
