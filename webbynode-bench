@@ -5,11 +5,11 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.5-network-budget-v3
+# Version: v2.5.1-network-budget-v3
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.5-network-budget-v3"
+RUNNER_VERSION="v2.5.1-network-budget-v3"
 SCHEMA_VERSION="1.4"
 METHODOLOGY_VERSION="3.0"
 EPOCH="v3"
@@ -26,8 +26,9 @@ NETWORK_ENDPOINT_PAYLOAD_BYTES="90000000"
 IPERF_TARGET_BPS="90000000"
 IPERF_DURATION="8"
 IPERF_PARALLEL="1"
-IPERF_RETRIES_MAX="1"
-IPERF_RETRY_SLEEP="${IPERF_RETRY_SLEEP:-30}"
+IPERF_BUSY_RETRIES_MAX="12"
+IPERF_BUSY_RETRY_BASE_SLEEP="3"
+IPERF_BUSY_RETRY_JITTER_MAX="3"
 
 FIO_RUNTIME="30"
 FIO_NUMJOBS="1"
@@ -1284,6 +1285,33 @@ iperf_result_has_error_json() {
   grep -qi '"error"' "$outfile"
 }
 
+iperf_result_payload_bytes() {
+  local outfile="$1"
+  python3 - "$outfile" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    end = value.get("end", {})
+    amounts = []
+    for key in ("sum_sent", "sum_received"):
+        amount = end.get(key, {}).get("bytes")
+        if isinstance(amount, (int, float)) and amount > 0:
+            amounts.append(int(amount))
+    print(max(amounts, default=0))
+except Exception:
+    print("")
+PY
+}
+
+busy_retry_delay_seconds() {
+  local jitter=0
+  if (( IPERF_BUSY_RETRY_JITTER_MAX > 0 )); then
+    jitter=$((RANDOM % (IPERF_BUSY_RETRY_JITTER_MAX + 1)))
+  fi
+  printf '%s' "$((IPERF_BUSY_RETRY_BASE_SLEEP + jitter))"
+}
+
 run_iperf_with_retry() {
   local endpoint_host="$1"
   local outfile="$2"
@@ -1295,7 +1323,7 @@ run_iperf_with_retry() {
   local rc=0
   local classified=""
 
-  while (( attempt <= IPERF_RETRIES_MAX )); do
+  while (( attempt <= IPERF_BUSY_RETRIES_MAX + 1 )); do
     local cmd=(
       iperf3 -c "$endpoint_host" -p "$IPERF_PORT"
       -P "$IPERF_PARALLEL"
@@ -1342,14 +1370,23 @@ run_iperf_with_retry() {
     classified="$(classify_iperf_error_reason "$outfile")"
 
     if [[ "$classified" == "failed_busy" ]]; then
-      if (( attempt < IPERF_RETRIES_MAX )); then
-        append_status_note "${label}=busy_retry_${attempt}"
-        sleep "$IPERF_RETRY_SLEEP"
+      local payload_bytes=""
+      payload_bytes="$(iperf_result_payload_bytes "$outfile")"
+      if [[ "$payload_bytes" =~ ^[0-9]+$ ]] && (( payload_bytes == 0 )) && (( attempt <= IPERF_BUSY_RETRIES_MAX )); then
+        local retry_delay=""
+        retry_delay="$(busy_retry_delay_seconds)"
+        append_status_note "${label}=busy_wait_${attempt}_${retry_delay}s"
+        log "${label}: endpoint busy before payload; waiting ${retry_delay}s (retry ${attempt}/${IPERF_BUSY_RETRIES_MAX})"
+        sleep "$retry_delay"
         ((attempt++))
         continue
       else
         printf -v "$status_var" '%s' "failed_busy"
-        append_status_note "${label}=failed_busy"
+        if [[ "$payload_bytes" =~ ^[0-9]+$ ]] && (( payload_bytes > 0 )); then
+          append_status_note "${label}=failed_busy_after_payload_no_retry"
+        else
+          append_status_note "${label}=failed_busy_retries_exhausted"
+        fi
         return 0
       fi
     fi
@@ -2435,4 +2472,6 @@ main() {
   write_integrity_manifest
 }
 
-main "$@"
+if [[ "${WEBBYNODE_BENCH_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi
