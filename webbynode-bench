@@ -5,11 +5,11 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.5.1-network-budget-v3
+# Version: v2.5.2-network-contention-v3
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.5.1-network-budget-v3"
+RUNNER_VERSION="v2.5.2-network-contention-v3"
 SCHEMA_VERSION="1.4"
 METHODOLOGY_VERSION="3.0"
 EPOCH="v3"
@@ -29,6 +29,8 @@ IPERF_PARALLEL="1"
 IPERF_BUSY_RETRIES_MAX="12"
 IPERF_BUSY_RETRY_BASE_SLEEP="3"
 IPERF_BUSY_RETRY_JITTER_MAX="3"
+NETWORK_STAGGER_SLOT_COUNT="3"
+NETWORK_STAGGER_SLOT_SECONDS="22"
 
 FIO_RUNTIME="30"
 FIO_NUMJOBS="1"
@@ -1304,6 +1306,73 @@ except Exception:
 PY
 }
 
+iperf_result_is_retryable_pre_payload() {
+  local outfile="$1"
+  python3 - "$outfile" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        value = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+
+error = str(value.get("error", "")).lower()
+retryable_errors = (
+    "server is busy",
+    "the server is busy",
+    "unable to receive control message",
+    "connection reset by peer",
+    "control socket has closed unexpectedly",
+)
+if not any(marker in error for marker in retryable_errors):
+    raise SystemExit(1)
+
+connected = value.get("start", {}).get("connected", [])
+intervals = value.get("intervals", [])
+if connected or intervals:
+    raise SystemExit(1)
+
+def transferred_bytes(node):
+    if isinstance(node, dict):
+        total = 0
+        for key, child in node.items():
+            if key == "bytes" and isinstance(child, (int, float)) and child > 0:
+                total += int(child)
+            else:
+                total += transferred_bytes(child)
+        return total
+    if isinstance(node, list):
+        return sum(transferred_bytes(child) for child in node)
+    return 0
+
+if transferred_bytes(value) != 0:
+    raise SystemExit(1)
+PY
+}
+
+network_stagger_slot() {
+  local host="${HOSTNAME_FQDN%%.*}"
+  local numeric_suffix=""
+  if [[ "$host" =~ ([0-9]+)$ ]]; then
+    numeric_suffix="${BASH_REMATCH[1]}"
+    if (( 10#$numeric_suffix > 0 )); then
+      printf '%s' "$(((10#$numeric_suffix - 1) % NETWORK_STAGGER_SLOT_COUNT))"
+      return 0
+    fi
+  fi
+
+  local checksum_hex=""
+  checksum_hex="$(printf '%s' "$host" | sha256sum | awk '{print substr($1, 1, 8)}')"
+  printf '%s' "$((16#$checksum_hex % NETWORK_STAGGER_SLOT_COUNT))"
+}
+
+network_stagger_delay_seconds() {
+  local slot=""
+  slot="$(network_stagger_slot)"
+  printf '%s' "$((slot * NETWORK_STAGGER_SLOT_SECONDS))"
+}
+
 busy_retry_delay_seconds() {
   local jitter=0
   if (( IPERF_BUSY_RETRY_JITTER_MAX > 0 )); then
@@ -1369,23 +1438,23 @@ run_iperf_with_retry() {
 
     classified="$(classify_iperf_error_reason "$outfile")"
 
-    if [[ "$classified" == "failed_busy" ]]; then
-      local payload_bytes=""
-      payload_bytes="$(iperf_result_payload_bytes "$outfile")"
+    local payload_bytes=""
+    payload_bytes="$(iperf_result_payload_bytes "$outfile")"
+    if iperf_result_is_retryable_pre_payload "$outfile"; then
       if [[ "$payload_bytes" =~ ^[0-9]+$ ]] && (( payload_bytes == 0 )) && (( attempt <= IPERF_BUSY_RETRIES_MAX )); then
         local retry_delay=""
         retry_delay="$(busy_retry_delay_seconds)"
-        append_status_note "${label}=busy_wait_${attempt}_${retry_delay}s"
-        log "${label}: endpoint busy before payload; waiting ${retry_delay}s (retry ${attempt}/${IPERF_BUSY_RETRIES_MAX})"
+        append_status_note "${label}=prepayload_wait_${attempt}_${retry_delay}s"
+        log "${label}: transient endpoint rejection before payload; waiting ${retry_delay}s (retry ${attempt}/${IPERF_BUSY_RETRIES_MAX})"
         sleep "$retry_delay"
         ((attempt++))
         continue
       else
-        printf -v "$status_var" '%s' "failed_busy"
+        printf -v "$status_var" '%s' "$classified"
         if [[ "$payload_bytes" =~ ^[0-9]+$ ]] && (( payload_bytes > 0 )); then
-          append_status_note "${label}=failed_busy_after_payload_no_retry"
+          append_status_note "${label}=${classified}_after_payload_no_retry"
         else
-          append_status_note "${label}=failed_busy_retries_exhausted"
+          append_status_note "${label}=${classified}_prepayload_retries_exhausted"
         fi
         return 0
       fi
@@ -1429,6 +1498,14 @@ capture_iperf_metrics() {
 }
 
 run_network() {
+  local stagger_delay=""
+  stagger_delay="$(network_stagger_delay_seconds)"
+  append_status_note "network_stagger=${stagger_delay}s"
+  if (( stagger_delay > 0 )); then
+    log "Staggering network benchmark ${stagger_delay}s for ${HOSTNAME_FQDN}"
+    sleep "$stagger_delay"
+  fi
+
   NETWORK_EGRESS_INTERFACE="$(detect_egress_interface)"
   NETWORK_EGRESS_BASELINE_BYTES="$(read_interface_tx_bytes "$NETWORK_EGRESS_INTERFACE" 2>/dev/null || true)"
   if [[ -z "$NETWORK_EGRESS_INTERFACE" || -z "$NETWORK_EGRESS_BASELINE_BYTES" ]]; then
