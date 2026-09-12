@@ -5,26 +5,26 @@ export LC_ALL=C
 # ==========================================================================
 # Webbynode Benchmark Runner
 # Name: webbynode-bench
-# Version: v2.5.2-network-contention-v3
+# Version: v2.6.0-network-fixed-byte-v4
 # ============================================================================
 
 SCRIPT_NAME="webbynode-bench"
-RUNNER_VERSION="v2.5.2-network-contention-v3"
-SCHEMA_VERSION="1.4"
-METHODOLOGY_VERSION="3.0"
-EPOCH="v3"
-MEASUREMENT_EPOCH="v3"
+RUNNER_VERSION="v2.6.0-network-fixed-byte-v4"
+SCHEMA_VERSION="1.5"
+METHODOLOGY_VERSION="4.0"
+EPOCH="v4"
+MEASUREMENT_EPOCH="v4"
 
 BASE_DIR="/benchmarks"
 IPERF_PORT="5201"
-NETWORK_PROTOCOL_VERSION="3.0"
+NETWORK_PROTOCOL_VERSION="4.0"
 NETWORK_CLUSTER_LIMIT_BYTES="1000000000"
 NETWORK_RUN_LIMIT_BYTES="333333333"
 NETWORK_GUARD_STOP_BYTES="320000000"
 NETWORK_PLANNED_PAYLOAD_BYTES="270000000"
 NETWORK_ENDPOINT_PAYLOAD_BYTES="90000000"
-IPERF_TARGET_BPS="90000000"
-IPERF_DURATION="8"
+NETWORK_TRANSFER_MODE="fixed-byte-uncapped"
+IPERF_SAFETY_TIMEOUT_SECONDS="120"
 IPERF_PARALLEL="1"
 IPERF_BUSY_RETRIES_MAX="12"
 IPERF_BUSY_RETRY_BASE_SLEEP="3"
@@ -229,11 +229,11 @@ Required:
   --price            Monthly price in USD
 
 Optional:
-  --measurement-epoch Accepted for launcher compatibility; Network Protocol v3 is enforced
+  --measurement-epoch Accepted for launcher compatibility; Network Protocol v4 is enforced
   --agent-sim-enabled 1/0 to enable agent simulation run (default: ${AGENT_SIM_ENABLED})
   --agent-sim-duration Duration in seconds for agent simulation run (default: ${AGENT_SIM_DURATION})
-  --iperf-parallel   Accepted for launcher compatibility; v3 always uses 1 stream
-  --iperf-duration   Accepted for launcher compatibility; v3 always uses 8 seconds
+  --iperf-parallel   Accepted for launcher compatibility; v4 always uses 1 stream
+  --iperf-duration   Accepted for launcher compatibility; ignored by fixed-byte v4
   -h, --help         Show help
 EOF2
 }
@@ -466,17 +466,17 @@ parse_args() {
         ;;
       --iperf-parallel)
         [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--iperf-parallel must be an integer"
-        [[ "${2:-}" == "1" ]] || log "Ignoring --iperf-parallel=${2:-}; Network Protocol v3 requires 1"
+        [[ "${2:-}" == "1" ]] || log "Ignoring --iperf-parallel=${2:-}; Network Protocol v4 requires 1"
         shift 2
         ;;
       --iperf-duration)
         [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--iperf-duration must be an integer"
-        [[ "${2:-}" == "8" ]] || log "Ignoring --iperf-duration=${2:-}; Network Protocol v3 requires 8 seconds"
+        log "Ignoring --iperf-duration=${2:-}; Network Protocol v4 uses a fixed-byte transfer"
         shift 2
         ;;
       --measurement-epoch)
         [[ -n "${2:-}" ]] || die "--measurement-epoch requires a value"
-        [[ "${2:-}" == "v3" ]] || log "Ignoring --measurement-epoch=${2:-}; this runner emits Network Protocol v3"
+        [[ "${2:-}" == "v4" ]] || log "Ignoring --measurement-epoch=${2:-}; this runner emits Network Protocol v4"
         shift 2
         ;;
       --agent-sim-enabled)
@@ -503,7 +503,7 @@ parse_args() {
   [[ -n "$PRICE" ]] || die "--price is required"
 
   [[ "$IPERF_PARALLEL" =~ ^[0-9]+$ ]] || die "--iperf-parallel must be an integer"
-  [[ "$IPERF_DURATION" =~ ^[0-9]+$ ]] || die "--iperf-duration must be an integer"
+  [[ "$IPERF_SAFETY_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "IPERF_SAFETY_TIMEOUT_SECONDS must be an integer"
   [[ "$AGENT_SIM_ENABLED" =~ ^[01]$ ]] || die "--agent-sim-enabled must be 0 or 1"
   [[ "$AGENT_SIM_DURATION" =~ ^[0-9]+$ ]] || die "--agent-sim-duration must be an integer"
   validate_price || die "--price must be a non-negative number"
@@ -1396,8 +1396,7 @@ run_iperf_with_retry() {
     local cmd=(
       iperf3 -c "$endpoint_host" -p "$IPERF_PORT"
       -P "$IPERF_PARALLEL"
-      -b "$IPERF_TARGET_BPS"
-      -t "$IPERF_DURATION"
+      -n "$NETWORK_ENDPOINT_PAYLOAD_BYTES"
     )
     if [[ "$reverse_flag" == "reverse" ]]; then
       cmd+=( -R )
@@ -1409,10 +1408,17 @@ run_iperf_with_retry() {
     "${cmd[@]}" > "$outfile" 2>&1 &
     local iperf_pid=$!
     local budget_stopped=0
+    local safety_timed_out=0
+    local attempt_started_seconds=$SECONDS
     while kill -0 "$iperf_pid" 2>/dev/null; do
       if update_network_egress_counter && (( NETWORK_EGRESS_MEASURED_BYTES >= NETWORK_GUARD_STOP_BYTES )); then
         kill -TERM "$iperf_pid" 2>/dev/null || true
         budget_stopped=1
+        break
+      fi
+      if (( SECONDS - attempt_started_seconds >= IPERF_SAFETY_TIMEOUT_SECONDS )); then
+        kill -TERM "$iperf_pid" 2>/dev/null || true
+        safety_timed_out=1
         break
       fi
       sleep 0.1
@@ -1421,12 +1427,18 @@ run_iperf_with_retry() {
     rc=$?
     if (( budget_stopped == 1 )); then
       rc=75
-      NETWORK_BUDGET_STATUS="guard_stopped"
+      NETWORK_BUDGET_STATUS="budget_noncompliant"
       append_status_note "network_budget=guard_stopped_at_${NETWORK_EGRESS_MEASURED_BYTES}_bytes"
     fi
     set -e
 
     printf -v "$retries_var" '%s' "$((attempt - 1))"
+
+    if (( safety_timed_out == 1 )); then
+      printf -v "$status_var" '%s' "failed_timeout"
+      append_status_note "${label}=failed_timeout_after_${IPERF_SAFETY_TIMEOUT_SECONDS}s"
+      return 0
+    fi
 
     local parsed
     parsed="$(parse_iperf_json "$outfile")"
@@ -1708,11 +1720,12 @@ write_run_json() {
     "$NET_ASIA_IN_RETRIES_USED" \
     "$(printf '%s\n' "${STATUS_NOTES[@]:-}")" \
     "$IPERF_PARALLEL" \
-    "$IPERF_DURATION" \
-    "$IPERF_TARGET_BPS" \
+    "$NETWORK_ENDPOINT_PAYLOAD_BYTES" \
+    "$IPERF_SAFETY_TIMEOUT_SECONDS" \
     "$NETWORK_PROTOCOL_VERSION" \
     "$NETWORK_CLUSTER_LIMIT_BYTES" \
     "$NETWORK_RUN_LIMIT_BYTES" \
+    "$NETWORK_GUARD_STOP_BYTES" \
     "$NETWORK_PLANNED_PAYLOAD_BYTES" \
     "$NETWORK_EGRESS_INTERFACE" \
     "$NETWORK_EGRESS_MEASURED_BYTES" \
@@ -1870,11 +1883,12 @@ import hashlib, json, os, socket, sys
   net_asia_in_retries_used,
   status_notes_blob,
   iperf_parallel,
-  iperf_duration,
-  iperf_target_bps,
+  network_endpoint_payload_bytes,
+  iperf_safety_timeout_seconds,
   network_protocol_version,
   network_cluster_limit_bytes,
   network_run_limit_bytes,
+  network_guard_stop_bytes,
   network_planned_payload_bytes,
   network_egress_interface,
   network_egress_measured_bytes,
@@ -2020,16 +2034,16 @@ def iperf_transfer(path, direction):
     value = load_json_optional(path) or {}
     end = value.get("end") or {}
     summary = end.get("sum_sent") or {}
+    received_summary = end.get("sum_received") or {}
     sent_bytes = integer(summary.get("bytes"))
+    received_bytes = integer(received_summary.get("bytes"))
     seconds = num(summary.get("seconds"))
     achieved = num(summary.get("bits_per_second"))
-    offered = integer(iperf_target_bps)
     return {
-        "application_bytes_sent": sent_bytes if direction == "outbound" else None,
-        "measured_seconds": seconds,
+        "application_bytes_sent": sent_bytes,
+        "application_bytes_received": received_bytes,
+        "transfer_duration_seconds": seconds,
         "achieved_bps": achieved,
-        "offered_load_bps": offered,
-        "attainment_ratio": (achieved / offered) if achieved is not None and offered else None,
     }
 
 def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps, raw_path):
@@ -2042,7 +2056,10 @@ def network_entry(slug, host, direction, status, retries, sent_bps, recv_bps, ra
     entry = {
         "direction": direction,
         "parallel_streams": integer(iperf_parallel),
-        "duration_seconds": integer(iperf_duration),
+        "transfer_mode": "fixed-byte-uncapped",
+        "requested_application_bytes": integer(network_endpoint_payload_bytes),
+        "external_safety_timeout_seconds": integer(iperf_safety_timeout_seconds),
+        "timed_out": status == "failed_timeout",
         "retries_used": integer(retries),
         "final_outcome": status,
         "result": result,
@@ -2210,11 +2227,14 @@ obj = {
                 "scope": "three-run-cluster",
                 "cluster_limit_bytes": integer(network_cluster_limit_bytes),
                 "run_limit_bytes": integer(network_run_limit_bytes),
+                "guard_stop_bytes": integer(network_guard_stop_bytes),
                 "planned_payload_bytes": integer(network_planned_payload_bytes),
+                "endpoint_payload_bytes": integer(network_endpoint_payload_bytes),
                 "measured_provider_egress_bytes": integer(network_egress_measured_bytes),
                 "application_bytes_sent": integer(network_application_bytes_sent),
-                "offered_load_bps": integer(iperf_target_bps),
-                "measurement_seconds": integer(iperf_duration),
+                "transfer_mode": "fixed-byte-uncapped",
+                "stream_count": integer(iperf_parallel),
+                "external_safety_timeout_seconds": integer(iperf_safety_timeout_seconds),
                 "egress_interface": network_egress_interface or None,
                 "enforcement": network_budget_enforcement,
                 "status": network_budget_status,
@@ -2523,6 +2543,42 @@ for name in [
 for endpoint in ['us_east', 'eu_west', 'asia']:
     if endpoint not in data['results']['network']:
         raise SystemExit(f'Missing network endpoint: {endpoint}')
+network = data['results']['network']
+budget = network.get('traffic_budget', {})
+if data.get('measurement_epoch') != 'v4' or data.get('methodology_version') != '4.0':
+    raise SystemExit('runner must emit measurement epoch v4 / methodology 4.0')
+expected_budget = {
+    'protocol_version': '4.0',
+    'scope': 'three-run-cluster',
+    'cluster_limit_bytes': 1000000000,
+    'run_limit_bytes': 333333333,
+    'guard_stop_bytes': 320000000,
+    'planned_payload_bytes': 270000000,
+    'endpoint_payload_bytes': 90000000,
+    'transfer_mode': 'fixed-byte-uncapped',
+    'stream_count': 1,
+}
+for key, expected in expected_budget.items():
+    if budget.get(key) != expected:
+        raise SystemExit(f'Invalid v4 traffic budget field {key}')
+if 'offered_load_bps' in budget or 'measurement_seconds' in budget:
+    raise SystemExit('v4 traffic budget must not contain rate or successful-duration controls')
+for endpoint in ['us_east', 'eu_west', 'asia']:
+    for direction in ['outbound', 'inbound']:
+        measurement = network[endpoint].get(direction, {})
+        if measurement.get('parallel_streams') != 1:
+            raise SystemExit(f'{endpoint}.{direction} must use one stream')
+        if measurement.get('transfer_mode') != 'fixed-byte-uncapped':
+            raise SystemExit(f'{endpoint}.{direction} must use fixed-byte-uncapped mode')
+        if measurement.get('requested_application_bytes') != 90000000:
+            raise SystemExit(f'{endpoint}.{direction} requested byte count mismatch')
+        if 'offered_load_bps' in measurement or 'duration_seconds' in measurement:
+            raise SystemExit(f'{endpoint}.{direction} contains a forbidden rate/duration control')
+        if measurement.get('final_outcome') == 'ok':
+            if measurement.get('application_bytes_sent') != 90000000:
+                raise SystemExit(f'{endpoint}.{direction} successful byte count mismatch')
+            if not isinstance(measurement.get('transfer_duration_seconds'), (int, float)):
+                raise SystemExit(f'{endpoint}.{direction} missing transfer duration')
 print('run.json validation passed')
 PY
 }
